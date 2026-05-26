@@ -2,7 +2,7 @@ pip install docker
 xhost +local:docker
 #!/bin/bash
 
-CONTAINERS="carla_sim autoware_mini_lofi autoware_mini_hifi" 
+CONTAINERS="opensbt_run carla_sim autoware_mini_lofi autoware_mini_hifi" 
 
 # Corresponding service names
 declare -A SERVICE_MAP=(

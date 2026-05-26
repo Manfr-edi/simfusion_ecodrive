@@ -24,6 +24,13 @@ try:
 except Exception as e:
     print(f"CommonRoad simulator could not be imported: {e}")
 
+# --- ECoDrive ---
+try:
+    from simulations.ecodrive.ecodrive_simulation import ECoDriveSimulator
+    SIMULATOR_MAPPING["ecodrive"] = ECoDriveSimulator.simulate
+except Exception as e:
+    print(f"ECoDrive simulator could not be imported: {e}")
+
 # --- Simple Sim / Autoware ---
 try:
     from simulations.simple_sim.autoware_simulation import AutowareSimulation

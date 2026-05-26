@@ -1,4 +1,3 @@
-# Ubuntu 20.04 tabanlı imaj kullanımı
 FROM ubuntu:20.04
 
 # Env vars
@@ -24,15 +23,24 @@ RUN apt-get update && apt-get install -y \
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.8 1
 
 # GPG anahtarını ve ROS paket deposunu ekle
-RUN curl -sSL 'http://packages.ros.org/ros.key' | apt-key add - && \
-    sh -c 'echo "deb http://packages.ros.org/ros/ubuntu focal main" > /etc/apt/sources.list.d/ros-latest.list'
+#RUN curl -sSL 'http://packages.ros.org/ros.key' | apt-key add - && \
+# sh -c 'echo "deb http://packages.ros.org/ros/ubuntu focal main" > /etc/apt/sources.list.d/ros-latest.list'
+
+RUN apt-get update && apt-get install -y curl gnupg2 lsb-release ca-certificates && \
+    curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+      -o /usr/share/keyrings/ros-archive-keyring.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros/ubuntu focal main" \
+      > /etc/apt/sources.list.d/ros-latest.list
 
 # ROS Noetic ve bağımlılıkları yükle
-RUN apt-get update && apt-get install -y --no-install-recommends ros-noetic-desktop-full && \
-    apt-get install -y python3-rosdep && \
-    rosdep init && \
-    rosdep fix-permissions && \
-    rosdep update
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ros-noetic-desktop-full \
+    python3-rosdep \
+    ros-noetic-jsk-recognition-msgs \
+    && rosdep init \
+    && rosdep fix-permissions \
+    && rosdep update \
+    && rm -rf /var/lib/apt/lists/*
 
 # Integrate Autoware mini messages into ROS
 RUN mkdir -p /home/ros_ws/src && \
