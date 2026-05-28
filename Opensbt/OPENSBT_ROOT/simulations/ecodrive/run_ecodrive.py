@@ -35,6 +35,7 @@ from opensbt.algorithm.nsga2_optimizer import NsgaIIOptimizer
 from opensbt.algorithm.ps import PureSampling
 from opensbt.algorithm.ps_rand import PureSamplingRand
 from opensbt.algorithm.ps_rand_adaptive import PureSamplingAdaptiveRandom
+from opensbt import config as opensbt_config
 from opensbt.experiment.search_configuration import DefaultSearchConfiguration
 from opensbt.problem.adas_problem import ADASProblem
 from opensbt.utils.wandb import logging_callback_archive, wandb_log_artifact, wandb_log_folder
@@ -62,12 +63,23 @@ def parse_args():
         help="Python interpreter that can import the CARLA 0.9.13 API and SUMO tools.",
     )
     parser.add_argument("--name_prefix", type=str, default="")
-    parser.add_argument("--seed", type=int, default=40) #72
+    parser.add_argument("--seed", type=int, default=42) #72
     parser.add_argument("--population_size", type=int, default=2)
     parser.add_argument("--n_generations", type=int, default=None)
     parser.add_argument("--maximal_execution_time", type=str, default=None)
     parser.add_argument("--algo", choices=["ga", "ps", "rand", "art"], default="ga")
     parser.add_argument("--results_folder", type=str, default=str(ECODRIVE_SIM_DIR / "results"))
+    parser.add_argument(
+        "--write_gifs",
+        action="store_true",
+        help="Write OpenSBT trajectory GIFs after the run. Disabled by default for ECoDrive because long traces are expensive.",
+    )
+    parser.add_argument(
+        "--gif_trace_interval",
+        type=float,
+        default=1.0,
+        help="Seconds between sampled frames when --write_gifs is enabled.",
+    )
     parser.add_argument("--project", type=str, default="ecodrive")
     parser.add_argument("--entity", type=str, default="lofi-hifi")
     parser.add_argument("--no_wandb", action="store_true")
@@ -124,6 +136,11 @@ args.results_folder = str(Path(args.results_folder).expanduser().resolve())
 
 if args.carla_python:
     os.environ["CARLA_PYTHON"] = args.carla_python
+
+if args.write_gifs:
+    opensbt_config.DEFAULT_TRACE_INTERVAL = args.gif_trace_interval
+else:
+    opensbt_config.NUM_GIF_MAX = 0
 
 if args.xl is None or args.xu is None:
     from ecodrive.scenario import sumo_route_tools as route_tools

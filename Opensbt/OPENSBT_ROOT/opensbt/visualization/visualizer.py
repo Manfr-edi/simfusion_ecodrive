@@ -920,6 +920,10 @@ def all_critical_individuals(res, save_folder):
 
 def simulations(res, save_folder, mode="all", write_max = 100, accessor = "SO", name_folder = "gif"):
     '''Visualization of the results of simulations'''
+    if write_max <= 0:
+        log.info("Skipping 2D scenario visualization in .gif.")
+        return
+
     problem = res.problem
     is_simulation = problem.is_simulation()
     if is_simulation:

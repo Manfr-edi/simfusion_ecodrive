@@ -72,17 +72,14 @@ def plot_scenario_gif(parameter_values,
     else:
         adversary_name = None
 
-    vehicles_names = actors["vehicles"]
-    
-    if "pedestrians" in actors:    
-        pedestrians_names = actors["pedestrians"]
-    else:
-        pedestrians_names = None
+    vehicles_names = actors.get("vehicles") or []
+    pedestrians_names = actors.get("pedestrians") or []
 
-    actors_names = [ego_name]  + \
-                    [adversary_name] if adversary_name is not None else [] + \
-                    vehicles_names if vehicles_names is not None else [] + \
-                    pedestrians_names if pedestrians_names is not None else []
+    actors_names = [ego_name]
+    if adversary_name is not None:
+        actors_names.append(adversary_name)
+    actors_names.extend(vehicles_names)
+    actors_names.extend(pedestrians_names)
 
     "Traces and yaws for actors"
     trace_ego = np.array(simout.location[ego_name][0::skip])  # time series of Ego position

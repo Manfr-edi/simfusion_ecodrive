@@ -16,7 +16,7 @@
     "traffic_spawn_time": 0.0,
     "traffic_stop_spawn_time": 20.0,
     "traffic_vehicle_type": "random",
-    "ego_starting_delay": 0.0,
+    "ego_starting_delay": 10.0,
     "ego_source_edge": "-38.0.00",
     "ego_destination_edge": "-41.0.00",
     "ego_energy_model": "Energy",
