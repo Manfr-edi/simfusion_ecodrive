@@ -13,6 +13,9 @@ import logging as log
 from opensbt.config import RESULTS_FOLDER, WRITE_ALL_INDIVIDUALS, EXPERIMENTAL_MODE
 import wandb
 
+OPENSBT_ROOT = Path(__file__).resolve().parents[2]
+
+
 class SimulationResult(Result):
     """
     This class extends pymoo's Result class to output simulation results 
@@ -222,8 +225,13 @@ class SimulationResult(Result):
 
         # copy over config file
         import shutil
-        shutil.copy("./simulations/config.py", save_folder + "/config.py.txt")
-        shutil.copy(self.problem.scenario_path, save_folder + "/scenario.xosc")
+        save_path = Path(save_folder)
+        simulations_config = OPENSBT_ROOT / "simulations" / "config.py"
+        if simulations_config.exists():
+            shutil.copy(str(simulations_config), str(save_path / "config.py.txt"))
+        else:
+            log.warning("Could not back up simulations config: %s does not exist", simulations_config)
+        shutil.copy(self.problem.scenario_path, str(save_path / "scenario.xosc"))
 
         if hasattr(self.problem, 'predictor'):
             src = self.problem.predictor.csv_folder

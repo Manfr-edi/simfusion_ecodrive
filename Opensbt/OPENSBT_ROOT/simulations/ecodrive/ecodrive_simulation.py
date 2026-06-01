@@ -492,34 +492,18 @@ def _to_simulation_output(
         ego_speed=speed,
     )
 
-    ego_actor = ego_id or "ego"
-    timestamps_by_actor = {"ego": times}
-    location_by_actor = {"ego": locations}
-    velocity_by_actor = {"ego": speed}
-    speed_by_actor = {"ego": speed}
-    acceleration_by_actor = {"ego": acceleration}
-    yaw_by_actor = {"ego": yaw}
-
-    if ego_actor != "ego":
-        timestamps_by_actor[ego_actor] = times
-        location_by_actor[ego_actor] = locations
-        velocity_by_actor[ego_actor] = speed
-        speed_by_actor[ego_actor] = speed
-        acceleration_by_actor[ego_actor] = acceleration
-        yaw_by_actor[ego_actor] = yaw
-
     return SimulationOutput(
         simTime=wall_time,
         times=times,
-        timestamps=timestamps_by_actor,
-        location=location_by_actor,
-        velocity=velocity_by_actor,
-        speed=speed_by_actor,
-        acceleration=acceleration_by_actor,
-        yaw=yaw_by_actor,
+        timestamps={"ego": times},
+        location={"ego": locations},
+        velocity={"ego": speed},
+        speed={"ego": speed},
+        acceleration={"ego": acceleration},
+        yaw={"ego": yaw},
         collisions=[],
         actors={
-            "ego": ego_actor,
+            "ego": "ego",
             "vehicles": [],
             "pedestrians": [],
         },

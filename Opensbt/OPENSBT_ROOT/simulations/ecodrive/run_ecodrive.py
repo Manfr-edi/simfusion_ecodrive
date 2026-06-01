@@ -1,6 +1,7 @@
 from datetime import datetime
 import argparse
 import glob
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -46,6 +47,20 @@ from simulations.utils import generate_problem_name
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
+WANDB_TAG_MAX_LENGTH = 64
+
+
+def wandb_tag(name, value):
+    tag = f"{name}:{value}"
+    if len(tag) <= WANDB_TAG_MAX_LENGTH:
+        return tag
+
+    digest = hashlib.sha1(tag.encode("utf-8")).hexdigest()[:8]
+    suffix = f"...{digest}"
+    keep = WANDB_TAG_MAX_LENGTH - len(name) - 1 - len(suffix)
+    if keep <= 0:
+        return f"{tag[:WANDB_TAG_MAX_LENGTH - len(suffix)]}{suffix}"
+    return f"{name}:{str(value)[:keep]}{suffix}"
 
 
 def parse_args():
@@ -67,7 +82,7 @@ def parse_args():
     parser.add_argument("--population_size", type=int, default=2)
     parser.add_argument("--n_generations", type=int, default=None)
     parser.add_argument("--maximal_execution_time", type=str, default=None)
-    parser.add_argument("--algo", choices=["ga", "ps", "rand", "art"], default="ga")
+    parser.add_argument("--algo", choices=["ga", "ps", "rand", "art"], default="rand")
     parser.add_argument("--results_folder", type=str, default=str(ECODRIVE_SIM_DIR / "results"))
     parser.add_argument(
         "--write_gifs",
@@ -81,7 +96,12 @@ def parse_args():
         help="Seconds between sampled frames when --write_gifs is enabled.",
     )
     parser.add_argument("--project", type=str, default="ecodrive")
-    parser.add_argument("--entity", type=str, default="lofi-hifi")
+    parser.add_argument(
+        "--entity",
+        type=str,
+        default=None,
+        help="W&B entity/account/team. If omitted, W&B uses the logged-in default.",
+    )
     parser.add_argument("--no_wandb", action="store_true")
     parser.add_argument(
         "--variables",
@@ -167,7 +187,7 @@ if args.xl is None or args.xu is None:
         )
     )
     default_bounds = {
-        "traffic_vehicle_count": (1, 10),
+        "traffic_vehicle_count": (1, 100), # TO BE DISCRETIZED
         "traffic_congestion_edge_index": (0, edge_count - 1),
         "traffic_source_edge_index": (0, edge_count - 1),
         "traffic_destination_edge_index": (0, edge_count - 1),
@@ -196,23 +216,33 @@ problem_name = generate_problem_name(
 )
 
 tags = [
-    f"simulator:ecodrive",
-    f"scenario:{args.scenario}",
-    f"variables:{','.join(args.variables)}",
-    f"xl:{args.xl}",
-    f"xu:{args.xu}",
-    f"optimizer_seed:{args.seed}",
+    wandb_tag("simulator", "ecodrive"),
+    wandb_tag("scenario", scenario_path.name),
+    wandb_tag("algo", args.algo),
+    wandb_tag("variables", ",".join(args.variables)),
+    wandb_tag("optimizer_seed", args.seed),
 ]
+wandb_config = {
+    **vars(args),
+    "problem_name": problem_name,
+    "scenario_name": scenario_path.name,
+}
 
 if args.no_wandb:
     wandb.init(mode="disabled")
 else:
+    wandb_init_kwargs = {
+        "project": args.project,
+        "name": problem_name,
+        "group": datetime.now().strftime("%d-%m-%Y"),
+        "tags": tags,
+        "config": wandb_config,
+    }
+    if args.entity:
+        wandb_init_kwargs["entity"] = args.entity
+
     wandb.init(
-        entity=args.entity,
-        project=args.project,
-        name=problem_name,
-        group=datetime.now().strftime("%d-%m-%Y"),
-        tags=tags,
+        **wandb_init_kwargs,
     )
 
 problem = ADASProblem(
