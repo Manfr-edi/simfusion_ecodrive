@@ -164,17 +164,19 @@ class PureSamplingAdaptiveRandom(Optimizer):
         res_holder.algorithm.opt = res_holder.opt
         res_holder.archive = pop
 
-        res_holder.history = []  # history is the same instance 
-        n_bucket = len(pop) // n_splits
-    
-        pop_sofar = 0
-        for i in range(0,n_splits):
-            
+        res_holder.history = []  # history is the same instance
+        effective_splits = min(max(1, int(n_splits)), len(pop))
+
+        for i in range(effective_splits):
+            bucket_start = (i * len(pop)) // effective_splits
+            bucket_end = ((i + 1) * len(pop)) // effective_splits
+            if bucket_end <= bucket_start:
+                continue
+
             algo = Algorithm()
-            algo.pop = pop[(i*n_bucket):min((i+1)*n_bucket,len(pop))]
-            algo.archive = pop[:min((i+1)*n_bucket,len(pop))]
-            pop_sofar += len(algo.pop)
-            algo.evaluator.n_eval = pop_sofar
+            algo.pop = pop[bucket_start:bucket_end]
+            algo.archive = pop[:bucket_end]
+            algo.evaluator.n_eval = bucket_end
             algo.opt = get_nondominated_population(algo.pop)
             res_holder.history.append(algo)
         

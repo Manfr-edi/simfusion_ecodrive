@@ -248,6 +248,7 @@ class SimulationResult(Result):
         visualizer.objective_space(self, save_folder)
         visualizer.optimal_individuals(self, save_folder)
         visualizer.all_critical_individuals(self,save_folder)
+        visualizer.failed_individuals(self, save_folder)
         visualizer.write_summary_results(self, save_folder)
         visualizer.simulations(self, 
                 save_folder,

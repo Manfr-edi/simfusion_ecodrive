@@ -25,7 +25,7 @@ def evaluate_individuals(population: Population, problem: Problem,
 
         if backup_folder != None:
             print("Writting test data.")
-            log_individual(ind, index, save_file)
+            log_individual(ind, index, save_file, problem=problem)
             
             write_simulation_output(Population(individuals =[ind]), save_folder=backup_folder,
                             accessor = "SO")
@@ -50,14 +50,23 @@ def ensure_csv_header(problem: Problem, backup_folder: str, backup_file: str):
     return save_file
 
 # Logging function
-def log_individual(ind, index, filename):
+def log_individual(ind, index, filename, problem=None):
     row = [index]
 
     # Extract design variables
     row.extend(ind.get("X"))
 
     # Extract fitness values
-    row.extend(ind.get("F"))
+    fitness_values = ind.get("F")
+    if problem is not None:
+        fitness_values = [
+            -value if direction == "max" else value
+            for value, direction in zip(
+                fitness_values,
+                problem.fitness_function.min_or_max,
+            )
+        ]
+    row.extend(fitness_values)
 
     # Append critical value if present
     row.append(ind.get("CB"))

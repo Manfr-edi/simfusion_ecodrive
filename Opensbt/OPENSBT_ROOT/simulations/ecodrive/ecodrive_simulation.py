@@ -8,12 +8,16 @@ import json
 import logging
 import math
 import os
+import shlex
 import subprocess
 import shutil
 import sys
+import tempfile
 import time
+import traceback
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -45,6 +49,8 @@ DEFAULT_ECODRIVE_CONFIG = {
     "headless": True,
     "traffic_generation_mode": "random",
     "traffic_congestion_edge": "-41.0.00",
+    "traffic_congestion_edge_scope": "all",
+    "traffic_endpoint_edge_scope": "all",
     "traffic_source_edge": None,
     "traffic_destination_edge": None,
     "traffic_vehicle_count": 5,
@@ -57,8 +63,13 @@ DEFAULT_ECODRIVE_CONFIG = {
     "ego_destination_edge": "-41.0.00",
     "ego_energy_model": "Energy",
     "ego_max_battery_capacity": 75000,
-    "ego_current_battery_charge": 1050,
+    "ego_current_battery_charge": 700,
     "ego_critical_battery_threshold": 500,
+    "ego_stall_timeout": 300.0,
+    "ego_stall_speed_threshold": 0.05,
+    "ego_stall_movement_tolerance": 1.0,
+    "ego_stop_and_go_stop_speed_threshold_mps": 0.5,
+    "ego_stop_and_go_go_speed_threshold_mps": 2.0,
     "runtime_retries": 2,
     "generate_plots": True,
     "ego_model_parameters": DEFAULT_EGO_MODEL_PARAMETERS,
@@ -78,6 +89,9 @@ PARAMETER_ALIASES = {
     "traffic_destination_edge_idx": "traffic_destination_edge_index",
     "ego_source_index": "ego_source_edge_index",
     "ego_source_edge_idx": "ego_source_edge_index",
+    "ego_source_near_congestion_idx": "ego_source_near_congestion_index",
+    "ego_start_near_congestion_index": "ego_source_near_congestion_index",
+    "ego_start_near_congestion_idx": "ego_source_near_congestion_index",
     "ego_destination_index": "ego_destination_edge_index",
     "ego_destination_edge_idx": "ego_destination_edge_index",
     "ego_delay": "ego_starting_delay",
@@ -102,6 +116,11 @@ EDGE_INDEX_FIELDS = {
     "traffic_destination_edge_index": "traffic_destination_edge",
     "ego_source_edge_index": "ego_source_edge",
     "ego_destination_edge_index": "ego_destination_edge",
+}
+
+
+RELATIVE_EDGE_INDEX_FIELDS = {
+    "ego_source_near_congestion_index": ("ego_source_edge", "traffic_congestion_edge"),
 }
 
 
@@ -131,6 +150,11 @@ FLOAT_FIELDS = {
     "completion_grace_period",
     "destination_edge_end_tolerance",
     "destination_stall_timeout",
+    "ego_stall_timeout",
+    "ego_stall_speed_threshold",
+    "ego_stall_movement_tolerance",
+    "ego_stop_and_go_stop_speed_threshold_mps",
+    "ego_stop_and_go_go_speed_threshold_mps",
 }
 
 
@@ -144,7 +168,20 @@ BOOL_FIELDS = {
 
 
 MODEL_PARAMETER_KEYS = set(DEFAULT_EGO_MODEL_PARAMETERS)
+ADAPTER_ONLY_FIELDS = {
+    "ego_stop_and_go_stop_speed_threshold_mps",
+    "ego_stop_and_go_go_speed_threshold_mps",
+}
+NON_CONTROLLABLE_FIELDS = ADAPTER_ONLY_FIELDS | {"ego_stop_and_go_count"}
+ARCHIVE_IGNORED_PATTERNS = (
+    "automated_run*",
+    "automated_simulation*",
+    "emission-output.xml",
+)
 AUTOMATED_ECODRIVE_ROOT, _IMPORT_ERROR, _automated_simulate = None, None, None
+_EVALUATION_COUNTERS: Dict[str, int] = {}
+_AUTOWARE_PATH_EDGE_REPORT_CACHE: Dict[tuple, Dict[str, Any]] = {}
+_AUTOWARE_REFERENCE_PATH_CACHE: Dict[tuple, Dict[str, Any]] = {}
 
 
 def _candidate_carla_python_executables() -> Iterable[Path]:
@@ -237,7 +274,7 @@ class ECoDriveSimulator(Simulator):
         scenario_path: str,
         sim_time: float = 600.0,
         time_step: float = 0.05,
-        do_visualize: bool = False,
+        do_visualize: bool = True,
     ) -> List[SimulationOutput]:
         if _automated_simulate is None:
             raise ImportError(
@@ -257,23 +294,60 @@ class ECoDriveSimulator(Simulator):
         results = []
         for index, individual in enumerate(list_individuals):
             params = _individual_to_dict(variable_names, individual)
-            scenario_name = _scenario_name(index, params)
+            evaluation_id = _next_evaluation_id(run_root, run_id)
+            scenario_name = _scenario_name(evaluation_id, params)
             scenario_folder = logs_dir / scenario_name
-            if scenario_folder.exists():
-                shutil.rmtree(scenario_folder)
             scenario_folder.mkdir(parents=True, exist_ok=True)
-
-            kwargs = _build_simulation_kwargs(
-                scenario_config=scenario_config,
-                individual_params=params,
-                sim_time=sim_time,
-                do_visualize=do_visualize,
-                progress_log_file=scenario_folder / "automated_simulation_progress.log",
+            progress_log_file = (
+                Path(tempfile.gettempdir())
+                / f"{scenario_name}_{os.getpid()}_automated_simulation_progress.log"
             )
 
-            logger.info("Simulating ECoDrive individual %s: %s", index, params)
             start_time = time.time()
-            result = _automated_simulate(**kwargs)
+            kwargs = {"progress_log_file": progress_log_file}
+            try:
+                kwargs = _build_simulation_kwargs(
+                    scenario_config=scenario_config,
+                    individual_params=params,
+                    sim_time=sim_time,
+                    do_visualize=do_visualize,
+                    progress_log_file=progress_log_file,
+                )
+                logger.info(
+                    "Simulating ECoDrive evaluation %s (batch individual %s): %s",
+                    evaluation_id,
+                    index,
+                    _params_with_resolved_edges(params, kwargs),
+                )
+                result = _automated_simulate(**_external_simulation_kwargs(kwargs))
+            except Exception as exc:
+                wall_time = time.time() - start_time
+                logger.exception(
+                    "ECoDrive evaluation %s (batch individual %s) failed; returning a penalized output.",
+                    evaluation_id,
+                    index,
+                )
+                _write_failed_result_metadata(
+                    scenario_folder,
+                    params=params,
+                    kwargs=kwargs,
+                    exc=exc,
+                    wall_time=wall_time,
+                    evaluation_id=evaluation_id,
+                )
+                results.append(
+                    _to_failed_simulation_output(
+                        params=params,
+                        kwargs=kwargs,
+                        scenario_folder=scenario_folder,
+                        exc=exc,
+                        wall_time=wall_time,
+                        evaluation_id=evaluation_id,
+                    )
+                )
+                _remove_file(progress_log_file)
+                continue
+
             archived_output = _archive_external_output(result, scenario_folder)
             _write_result_metadata(
                 scenario_folder,
@@ -281,6 +355,7 @@ class ECoDriveSimulator(Simulator):
                 kwargs=kwargs,
                 result=result,
                 archived_output=archived_output,
+                evaluation_id=evaluation_id,
             )
 
             results.append(
@@ -291,8 +366,10 @@ class ECoDriveSimulator(Simulator):
                     scenario_folder=scenario_folder,
                     wall_time=time.time() - start_time,
                     time_step=time_step,
+                    evaluation_id=evaluation_id,
                 )
             )
+            _remove_file(progress_log_file)
 
         return results
 
@@ -358,25 +435,101 @@ def _build_simulation_kwargs(
     if "simulation_end" not in config or config.get("simulation_end") is None:
         config["simulation_end"] = float(sim_time)
 
+    deferred_relative_params = []
     for raw_name, value in individual_params.items():
+        name = PARAMETER_ALIASES.get(raw_name, raw_name)
+        if (
+            name in RELATIVE_EDGE_INDEX_FIELDS
+            or (
+                name == "traffic_congestion_edge_index"
+                and _traffic_congestion_edge_scope(config) == "ego_route"
+            )
+            or (
+                name in {"traffic_source_edge_index", "traffic_destination_edge_index"}
+                and _traffic_endpoint_edge_scope(config) == "ego_route_adjacent"
+            )
+        ):
+            deferred_relative_params.append((raw_name, value))
+        else:
+            _apply_individual_override(config, raw_name, value)
+    for raw_name, value in deferred_relative_params:
         _apply_individual_override(config, raw_name, value)
 
     config["progress_log_file"] = progress_log_file
     _coerce_config_types(config)
 
     accepted = set(inspect.signature(_automated_simulate).parameters)
-    return {
+    kwargs = {
         key: value
         for key, value in config.items()
         if key in accepted and value is not None
     }
+    kwargs.update(
+        {
+            key: config[key]
+            for key in ADAPTER_ONLY_FIELDS
+            if config.get(key) is not None
+        }
+    )
+    return kwargs
+
+
+def _external_simulation_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in kwargs.items()
+        if key not in ADAPTER_ONLY_FIELDS
+    }
+
+
+def _params_with_resolved_edges(params: Dict[str, Any], kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    logged_params = dict(params)
+    for raw_name in params:
+        name = PARAMETER_ALIASES.get(raw_name, raw_name)
+        edge_field = EDGE_INDEX_FIELDS.get(name)
+        if edge_field and kwargs.get(edge_field) is not None:
+            logged_params[edge_field] = kwargs[edge_field]
+        relative_edge_field = RELATIVE_EDGE_INDEX_FIELDS.get(name)
+        if relative_edge_field and kwargs.get(relative_edge_field[0]) is not None:
+            logged_params[relative_edge_field[0]] = kwargs[relative_edge_field[0]]
+    return logged_params
 
 
 def _apply_individual_override(config: Dict[str, Any], raw_name: str, value: Any) -> None:
     name = PARAMETER_ALIASES.get(raw_name, raw_name)
 
+    if name in NON_CONTROLLABLE_FIELDS:
+        raise ValueError(
+            f"{name} is an ECoDrive reporting setting or metric and cannot be "
+            "used as a controllable simulation variable."
+        )
+
+    if (
+        name == "traffic_congestion_edge_index"
+        and _traffic_congestion_edge_scope(config) == "ego_route"
+    ):
+        config["traffic_congestion_edge"] = _traffic_congestion_edge_id_from_index(value, config)
+        return
+
+    if (
+        name in {"traffic_source_edge_index", "traffic_destination_edge_index"}
+        and _traffic_endpoint_edge_scope(config) == "ego_route_adjacent"
+    ):
+        edge_field = EDGE_INDEX_FIELDS[name]
+        config[edge_field] = _traffic_endpoint_edge_id_from_index(name, value, config)
+        return
+
     if name in EDGE_INDEX_FIELDS:
         config[EDGE_INDEX_FIELDS[name]] = _edge_id_from_index(value, config)
+        return
+
+    if name in RELATIVE_EDGE_INDEX_FIELDS:
+        target_field, reference_field = RELATIVE_EDGE_INDEX_FIELDS[name]
+        config[target_field] = _edge_id_near_reference_index(
+            value,
+            reference_edge_id=config.get(reference_field),
+            config=config,
+        )
         return
 
     for prefix in ("ego_model_parameters.", "ego_model_parameters__"):
@@ -411,6 +564,536 @@ def _edge_id_from_index(index: Any, config: Dict[str, Any]) -> str:
     )
 
 
+def traffic_congestion_edge_candidates(config: Dict[str, Any]) -> List[str]:
+    """Return the edge IDs selectable by traffic_congestion_edge_index."""
+    if _traffic_congestion_edge_scope(config) == "all":
+        return _all_sumo_edge_candidates(config)
+    return list(autoware_path_edge_report(config)["edge_ids"])
+
+
+def traffic_source_edge_candidates(config: Dict[str, Any]) -> List[str]:
+    """Return the edge IDs selectable by traffic_source_edge_index."""
+    return _traffic_endpoint_edge_candidates("traffic_source_edge_index", config)
+
+
+def traffic_destination_edge_candidates(config: Dict[str, Any]) -> List[str]:
+    """Return the edge IDs selectable by traffic_destination_edge_index."""
+    return _traffic_endpoint_edge_candidates("traffic_destination_edge_index", config)
+
+
+def autoware_path_edge_report(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Map the path chosen by Autoware's Lanelet2 planner to overlapping SUMO edge IDs."""
+    from ecodrive.scenario import sumo_route_tools as route_tools
+
+    effective_config = copy.deepcopy(DEFAULT_ECODRIVE_CONFIG)
+    _deep_update(effective_config, config)
+    config = effective_config
+    town = config.get("town") or "Town04"
+    order_by = config.get("edge_order_by", "spatial")
+    min_length = config.get("edge_min_length", 0.0)
+    route_tools.set_active_carla_version("0.9.13")
+
+    if (
+        _traffic_congestion_edge_scope(config) == "all"
+        and _traffic_endpoint_edge_scope(config) == "all"
+    ):
+        edge_ids = _all_sumo_edge_candidates(config)
+        return {
+            "source": "sumo_edge_catalog",
+            "lanelet_ids": [],
+            "edge_ids": edge_ids,
+            "edge_matches": [],
+        }
+
+    source_edge = config.get("ego_source_edge")
+    destination_edge = config.get("ego_destination_edge")
+    if not source_edge or not destination_edge:
+        raise ValueError(
+            "ego_source_edge and ego_destination_edge are required when "
+            "traffic edges are scoped to the ego route."
+        )
+
+    max_distance = float(config.get("autoware_path_edge_max_distance", 5.0))
+    max_heading_delta = float(config.get("autoware_path_edge_max_heading_delta", 60.0))
+    cache_key = (
+        town,
+        str(source_edge),
+        str(destination_edge),
+        order_by,
+        float(min_length),
+        max_distance,
+        max_heading_delta,
+    )
+    if cache_key in _AUTOWARE_PATH_EDGE_REPORT_CACHE:
+        return copy.deepcopy(_AUTOWARE_PATH_EDGE_REPORT_CACHE[cache_key])
+
+    autoware_path = _autoware_reference_path(config, route_tools=route_tools)
+    report = _match_autoware_path_to_sumo_edges(
+        autoware_path,
+        town=town,
+        order_by=order_by,
+        min_length=min_length,
+        max_distance=max_distance,
+        max_heading_delta=max_heading_delta,
+        route_tools=route_tools,
+    )
+    if not report["edge_ids"]:
+        raise ValueError(
+            f"No selectable SUMO congestion edges overlap the Autoware path from "
+            f"{source_edge!r} to {destination_edge!r} in {town}."
+        )
+    report.update(
+        _adjacent_sumo_endpoint_edges(
+            report["edge_ids"],
+            town=town,
+            order_by=order_by,
+            min_length=min_length,
+            route_tools=route_tools,
+        )
+    )
+    _AUTOWARE_PATH_EDGE_REPORT_CACHE[cache_key] = report
+    return copy.deepcopy(report)
+
+
+def _autoware_reference_path(
+    config: Dict[str, Any],
+    *,
+    route_tools: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Return the fixed Autoware path and its SUMO-coordinate centerline."""
+    if route_tools is None:
+        from ecodrive.scenario import sumo_route_tools as route_tools
+
+    effective_config = copy.deepcopy(DEFAULT_ECODRIVE_CONFIG)
+    _deep_update(effective_config, config)
+    config = effective_config
+    town = config.get("town") or "Town04"
+    source_edge = config.get("ego_source_edge")
+    destination_edge = config.get("ego_destination_edge")
+    if not source_edge or not destination_edge:
+        raise ValueError(
+            "ego_source_edge and ego_destination_edge are required to calculate "
+            "distance along the fixed Autoware route."
+        )
+
+    route_tools.set_active_carla_version("0.9.13")
+    cache_key = (town, str(source_edge), str(destination_edge))
+    if cache_key in _AUTOWARE_REFERENCE_PATH_CACHE:
+        return copy.deepcopy(_AUTOWARE_REFERENCE_PATH_CACHE[cache_key])
+
+    reference = _plan_autoware_lanelet_path(
+        town=town,
+        source_edge_id=str(source_edge),
+        destination_edge_id=str(destination_edge),
+        route_tools=route_tools,
+    )
+    map_points = _joined_centerline_points(reference["centerlines"])
+    offset_x, offset_y = route_tools._net_location_offset(town)
+    reference["sumo_centerline"] = [
+        [float(map_x + offset_x), float(map_y + offset_y)]
+        for map_x, map_y in map_points
+    ]
+    reference["route_length"] = _polyline_length(reference["sumo_centerline"])
+    _AUTOWARE_REFERENCE_PATH_CACHE[cache_key] = reference
+    return copy.deepcopy(reference)
+
+
+def _joined_centerline_points(centerlines: Sequence[Sequence[Sequence[float]]]) -> List[Tuple[float, float]]:
+    points: List[Tuple[float, float]] = []
+    for centerline in centerlines:
+        line = [(float(point[0]), float(point[1])) for point in centerline]
+        if points and line and points[-1] == line[0]:
+            line = line[1:]
+        points.extend(line)
+    return points
+
+
+def _polyline_length(points: Sequence[Sequence[float]]) -> float:
+    return float(
+        sum(
+            math.hypot(float(end[0]) - float(start[0]), float(end[1]) - float(start[1]))
+            for start, end in zip(points, points[1:])
+        )
+    )
+
+
+def _traffic_congestion_edge_scope(config: Dict[str, Any]) -> str:
+    scope = str(config.get("traffic_congestion_edge_scope", "all") or "all").strip().lower()
+    if scope not in {"all", "ego_route"}:
+        raise ValueError("traffic_congestion_edge_scope must be either 'all' or 'ego_route'.")
+    return scope
+
+
+def _traffic_endpoint_edge_scope(config: Dict[str, Any]) -> str:
+    scope = str(config.get("traffic_endpoint_edge_scope", "all") or "all").strip().lower()
+    if scope not in {"all", "ego_route_adjacent"}:
+        raise ValueError(
+            "traffic_endpoint_edge_scope must be either 'all' or 'ego_route_adjacent'."
+        )
+    return scope
+
+
+def _traffic_congestion_edge_id_from_index(index: Any, config: Dict[str, Any]) -> str:
+    candidates = traffic_congestion_edge_candidates(config)
+    selected = max(0, min(len(candidates) - 1, int(round(float(index)))))
+    return candidates[selected]
+
+
+def _traffic_endpoint_edge_candidates(name: str, config: Dict[str, Any]) -> List[str]:
+    if _traffic_endpoint_edge_scope(config) == "ego_route_adjacent":
+        report = autoware_path_edge_report(config)
+        report_field = {
+            "traffic_source_edge_index": "traffic_source_edge_ids",
+            "traffic_destination_edge_index": "traffic_destination_edge_ids",
+        }[name]
+        return list(report[report_field])
+
+    return _all_sumo_edge_candidates(config)
+
+
+def _all_sumo_edge_candidates(config: Dict[str, Any]) -> List[str]:
+    from ecodrive.scenario import sumo_route_tools as route_tools
+
+    town = config.get("town") or "Town04"
+    order_by = config.get("edge_order_by", "spatial")
+    min_length = config.get("edge_min_length", 0.0)
+    route_tools.set_active_carla_version("0.9.13")
+    return [
+        item["edge_id"]
+        for item in route_tools.edge_catalog(
+            town,
+            order_by=order_by,
+            min_length=min_length,
+        )
+    ]
+
+
+def _traffic_endpoint_edge_id_from_index(
+    name: str,
+    index: Any,
+    config: Dict[str, Any],
+) -> str:
+    candidates = _traffic_endpoint_edge_candidates(name, config)
+    if not candidates:
+        raise ValueError(f"No selectable candidates found for {name}.")
+    selected = max(0, min(len(candidates) - 1, int(round(float(index)))))
+    return candidates[selected]
+
+
+def _adjacent_sumo_endpoint_edges(
+    path_edge_ids: List[str],
+    *,
+    town: str,
+    order_by: str,
+    min_length: float,
+    route_tools: Any,
+) -> Dict[str, Any]:
+    """Find external road edges at graph distance one from the Autoware path."""
+    if not path_edge_ids:
+        return {
+            "traffic_source_edge_ids": [],
+            "traffic_destination_edge_ids": [],
+            "traffic_source_edge_connections": [],
+            "traffic_destination_edge_connections": [],
+        }
+
+    catalog = route_tools.edge_catalog(
+        town,
+        order_by=order_by,
+        min_length=min_length,
+    )
+    selectable_ids = {item["edge_id"] for item in catalog}
+    catalog_order = {item["edge_id"]: item["index"] for item in catalog}
+    path_ids = set(path_edge_ids)
+    source_connections = set()
+    destination_connections = set()
+
+    root = ET.parse(route_tools.map_net_file(town)).getroot()
+    for connection in root.findall("connection"):
+        source = connection.get("from")
+        destination = connection.get("to")
+        if source not in selectable_ids or destination not in selectable_ids:
+            continue
+        if destination in path_ids and source not in path_ids:
+            source_connections.add((source, destination))
+        if source in path_ids and destination not in path_ids:
+            destination_connections.add((source, destination))
+
+    source_connections = sorted(
+        source_connections,
+        key=lambda item: catalog_order[item[0]],
+    )
+    destination_connections = sorted(
+        destination_connections,
+        key=lambda item: catalog_order[item[1]],
+    )
+    source_edge_ids = sorted(
+        {source for source, _ in source_connections},
+        key=catalog_order.__getitem__,
+    )
+    destination_edge_ids = sorted(
+        {destination for _, destination in destination_connections},
+        key=catalog_order.__getitem__,
+    )
+    return {
+        "traffic_source_edge_ids": source_edge_ids,
+        "traffic_destination_edge_ids": destination_edge_ids,
+        "traffic_source_edge_connections": [
+            {"edge_id": source, "connects_to_path_edge": destination}
+            for source, destination in source_connections
+        ],
+        "traffic_destination_edge_connections": [
+            {"edge_id": destination, "connects_from_path_edge": source}
+            for source, destination in destination_connections
+        ],
+    }
+
+
+def _plan_autoware_lanelet_path(
+    *,
+    town: str,
+    source_edge_id: str,
+    destination_edge_id: str,
+    route_tools: Any,
+) -> Dict[str, Any]:
+    """Run the same Lanelet2 routing logic and configuration used by Autoware Mini."""
+    start_pose = route_tools.autoware_pose_from_edge(source_edge_id, map_name=town)["pose"]
+    goal_pose = route_tools.autoware_pose_from_edge(destination_edge_id, map_name=town)["pose"]
+    container = route_tools.find_running_autoware_container()
+    container_name = container.get("Names") or container.get("ID")
+    docker_binary = shutil.which("docker")
+    if not docker_binary:
+        raise RuntimeError("Docker is required to query the Autoware Lanelet2 planner.")
+
+    planner_script = r"""
+import itertools
+import json
+import os
+
+import lanelet2
+import yaml
+from lanelet2.core import BasicPoint2d
+from lanelet2.geometry import findWithin2d
+from lanelet2.io import Origin, load
+from lanelet2.projection import UtmProjector
+from lanelet2.routing import RoutingCostDistance, RoutingCostTravelTime
+
+root = "/opt/catkin_ws/src/autoware_mini"
+with open(f"{root}/config/planning.yaml", encoding="utf-8") as handle:
+    planning = yaml.safe_load(handle)
+with open(f"{root}/config/localization.yaml", encoding="utf-8") as handle:
+    localization = yaml.safe_load(handle)
+
+planner = planning["lanelet2_global_planner"]
+routing_cost = planner["routing_cost"]
+if routing_cost == "distance":
+    routing_costs = [RoutingCostDistance(10)]
+elif routing_cost == "travel_time":
+    routing_costs = [RoutingCostTravelTime(5)]
+else:
+    raise ValueError(f"Unsupported Autoware routing cost: {routing_cost}")
+
+if localization["coordinate_transformer"] != "utm":
+    raise ValueError("Only Autoware's UTM coordinate transformer is supported.")
+projector = UtmProjector(
+    Origin(localization["utm_origin_lat"], localization["utm_origin_lon"]),
+    localization["use_custom_origin"],
+    False,
+)
+lanelet_map = load(f"{root}/data/maps/{os.environ['MAP_NAME']}.osm", projector)
+traffic_rules = lanelet2.traffic_rules.create(
+    lanelet2.traffic_rules.Locations.Germany,
+    lanelet2.traffic_rules.Participants.VehicleTaxi,
+)
+graph = lanelet2.routing.RoutingGraph(lanelet_map, traffic_rules, routing_costs)
+start = (float(os.environ["START_X"]), float(os.environ["START_Y"]))
+goal = (float(os.environ["GOAL_X"]), float(os.environ["GOAL_Y"]))
+radius = float(planner["lanelet_search_radius"])
+
+def candidates(point):
+    return [
+        lanelet
+        for _, lanelet in findWithin2d(
+            lanelet_map.laneletLayer,
+            BasicPoint2d(*point),
+            radius,
+        )
+    ]
+
+start_candidates = candidates(start)
+goal_candidates = candidates(goal)
+best = None
+for source, destination in itertools.product(start_candidates, goal_candidates):
+    route = graph.getRouteVia(source, [], destination, 0, bool(planner["lane_change"]))
+    if route is None:
+        continue
+    route_length = route.length2d()
+    if best is None or route_length < best[0]:
+        best = (route_length, route)
+
+if best is None:
+    raise RuntimeError("Autoware Lanelet2 planner found no route.")
+path = best[1].shortestPath()
+print(json.dumps({
+    "routing_cost": routing_cost,
+    "lane_change": bool(planner["lane_change"]),
+    "lanelet_search_radius": radius,
+    "route_length": best[0],
+    "start_lanelet_candidates": [lanelet.id for lanelet in start_candidates],
+    "goal_lanelet_candidates": [lanelet.id for lanelet in goal_candidates],
+    "lanelet_ids": [lanelet.id for lanelet in path],
+    "centerlines": [
+        [[point.x, point.y, point.z] for point in lanelet.centerline]
+        for lanelet in path
+    ],
+}))
+""".strip()
+    command = [
+        docker_binary,
+        "exec",
+        "-e", f"MAP_NAME={town}",
+        "-e", f"START_X={float(start_pose['x'])}",
+        "-e", f"START_Y={float(start_pose['y'])}",
+        "-e", f"GOAL_X={float(goal_pose['x'])}",
+        "-e", f"GOAL_Y={float(goal_pose['y'])}",
+        str(container_name),
+        "bash",
+        "-lc",
+        (
+            "source /opt/ros/noetic/setup.bash && "
+            "source /opt/catkin_ws/devel/setup.bash && "
+            f"python3 -c {shlex.quote(planner_script)}"
+        ),
+    ]
+    process = subprocess.run(command, capture_output=True, text=True)
+    if process.returncode != 0:
+        details = process.stderr.strip() or process.stdout.strip()
+        raise RuntimeError(f"Could not query the Autoware Lanelet2 planner: {details}")
+    try:
+        return json.loads(process.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Autoware Lanelet2 planner returned an invalid payload.") from exc
+
+
+def _match_autoware_path_to_sumo_edges(
+    autoware_path: Dict[str, Any],
+    *,
+    town: str,
+    order_by: str,
+    min_length: float,
+    max_distance: float,
+    max_heading_delta: float,
+    route_tools: Any,
+) -> Dict[str, Any]:
+    selectable_ids = {
+        item["edge_id"]
+        for item in route_tools.edge_catalog(
+            town,
+            order_by=order_by,
+            min_length=min_length,
+        )
+    }
+    edges = [
+        edge for edge in route_tools.read_sumo_edges(town)
+        if edge.edge_id in selectable_ids
+    ]
+    offset_x, offset_y = route_tools._net_location_offset(town)
+    points = _joined_centerline_points(autoware_path["centerlines"])
+
+    matches = []
+    for index, (map_x, map_y) in enumerate(points):
+        if index + 1 < len(points):
+            next_x, next_y = points[index + 1]
+        elif index > 0:
+            next_x = map_x + (map_x - points[index - 1][0])
+            next_y = map_y + (map_y - points[index - 1][1])
+        else:
+            continue
+        path_heading = math.degrees(math.atan2(next_y - map_y, next_x - map_x))
+        sumo_x, sumo_y = map_x + offset_x, map_y + offset_y
+        candidates = []
+        for edge in edges:
+            segment_matches = []
+            for start, end in zip(edge.shape, edge.shape[1:]):
+                distance = route_tools._point_segment_distance(
+                    sumo_x,
+                    sumo_y,
+                    start[0],
+                    start[1],
+                    end[0],
+                    end[1],
+                )
+                segment_heading = math.degrees(
+                    math.atan2(end[1] - start[1], end[0] - start[0])
+                )
+                heading_delta = abs(
+                    (path_heading - segment_heading + 180.0) % 360.0 - 180.0
+                )
+                if heading_delta <= max_heading_delta:
+                    segment_matches.append((distance, heading_delta))
+            if segment_matches:
+                distance, heading_delta = min(segment_matches)
+                candidates.append((distance, heading_delta, edge.edge_id))
+        if not candidates:
+            continue
+        distance, heading_delta, edge_id = min(candidates)
+        if distance > max_distance:
+            continue
+        if matches and matches[-1]["edge_id"] == edge_id:
+            matches[-1]["last_waypoint_index"] = index
+            matches[-1]["waypoint_count"] += 1
+            matches[-1]["min_distance"] = min(matches[-1]["min_distance"], distance)
+            matches[-1]["max_distance"] = max(matches[-1]["max_distance"], distance)
+            continue
+        matches.append({
+            "edge_id": edge_id,
+            "first_waypoint_index": index,
+            "last_waypoint_index": index,
+            "waypoint_count": 1,
+            "min_distance": distance,
+            "max_distance": distance,
+            "heading_delta": heading_delta,
+        })
+
+    for match in matches:
+        for field in ("min_distance", "max_distance", "heading_delta"):
+            match[field] = round(float(match[field]), 3)
+
+    return {
+        "source": "autoware_lanelet2_global_planner",
+        "routing_cost": autoware_path["routing_cost"],
+        "lane_change": autoware_path["lane_change"],
+        "lanelet_search_radius": autoware_path["lanelet_search_radius"],
+        "route_length": autoware_path["route_length"],
+        "start_lanelet_candidates": autoware_path["start_lanelet_candidates"],
+        "goal_lanelet_candidates": autoware_path["goal_lanelet_candidates"],
+        "lanelet_ids": autoware_path["lanelet_ids"],
+        "edge_ids": [match["edge_id"] for match in matches],
+        "edge_matches": matches,
+        "max_edge_distance": max_distance,
+        "max_heading_delta": max_heading_delta,
+    }
+
+
+def _edge_id_near_reference_index(index: Any, reference_edge_id: Any, config: Dict[str, Any]) -> str:
+    from ecodrive.scenario import sumo_route_tools as route_tools
+
+    if not reference_edge_id:
+        raise ValueError("A reference congestion edge is required to resolve ego_source_near_congestion_index.")
+
+    town = config.get("town") or "Town04"
+    order_by = config.get("edge_order_by", "spatial")
+    min_length = config.get("edge_min_length", 0.0)
+    route_tools.set_active_carla_version("0.9.13")
+    return route_tools.edge_id_near_edge(
+        reference_edge_id,
+        index,
+        map_name=town,
+        order_by=order_by,
+        min_length=min_length,
+    )
+
+
 def _coerce_config_types(config: Dict[str, Any]) -> None:
     for field in INT_FIELDS:
         if field in config and config[field] is not None:
@@ -429,6 +1112,11 @@ def _coerce_config_types(config: Dict[str, Any]) -> None:
     for key, value in list(config.get("ego_model_attributes", {}).items()):
         config["ego_model_attributes"][key] = _to_builtin(value)
 
+    _validate_stop_and_go_thresholds(
+        config["ego_stop_and_go_stop_speed_threshold_mps"],
+        config["ego_stop_and_go_go_speed_threshold_mps"],
+    )
+
 
 def _to_simulation_output(
     result: Any,
@@ -438,6 +1126,7 @@ def _to_simulation_output(
     scenario_folder: Path,
     wall_time: float,
     time_step: float,
+    evaluation_id: int,
 ) -> SimulationOutput:
     battery_df = _read_result_csv(result, "battery")
     emission_df = _read_result_csv(result, "emission")
@@ -476,6 +1165,7 @@ def _to_simulation_output(
         acceleration = [0.0 for _ in times]
         yaw = [0.0 for _ in times]
 
+    reference_locations = list(locations)
     locations = _fit_length(locations, len(times), fill=(0.0, 0.0, 0.0))
     speed = _fit_length(speed, len(times), fill=0.0)
     acceleration = _fit_length(acceleration, len(times), fill=0.0)
@@ -490,6 +1180,8 @@ def _to_simulation_output(
         energy_df=energy_df,
         ego_id=ego_id,
         ego_speed=speed,
+        ego_locations=reference_locations,
+        evaluation_id=evaluation_id,
     )
 
     return SimulationOutput(
@@ -521,23 +1213,45 @@ def _other_params(
     energy_df: pd.DataFrame,
     ego_id: Optional[str],
     ego_speed: List[float],
+    ego_locations: List[tuple],
+    evaluation_id: int,
 ) -> Dict[str, Any]:
     metrics = _energy_metrics(energy_df)
     ego_tripinfo = getattr(result, "ego_tripinfo", None) or {}
     tripinfo_metrics = _tripinfo_metrics(ego_tripinfo)
     speed_metrics = _speed_metrics(ego_speed, tripinfo_metrics)
+    stop_and_go_metrics = _stop_and_go_metrics(
+        ego_speed,
+        stop_speed_threshold_mps=kwargs.get(
+            "ego_stop_and_go_stop_speed_threshold_mps",
+            DEFAULT_ECODRIVE_CONFIG["ego_stop_and_go_stop_speed_threshold_mps"],
+        ),
+        go_speed_threshold_mps=kwargs.get(
+            "ego_stop_and_go_go_speed_threshold_mps",
+            DEFAULT_ECODRIVE_CONFIG["ego_stop_and_go_go_speed_threshold_mps"],
+        ),
+    )
     critical_threshold = kwargs.get("ego_critical_battery_threshold")
     final_battery = metrics.get("final_battery_capacity")
+    completion_reason = getattr(result, "completion_reason", None)
+    last_ego_state = _state_with_reference_route_metrics(
+        getattr(result, "last_ego_state", {}) or {},
+        config=kwargs,
+        ego_locations=ego_locations,
+    )
 
     other = {
         "simulator": "ECoDriveSimulator",
+        "evaluation_id": evaluation_id,
+        "simulation_status": _simulation_status(completion_reason),
+        "simulation_failed": False,
         "automated_ecodrive_root": str(AUTOMATED_ECODRIVE_ROOT) if AUTOMATED_ECODRIVE_ROOT else None,
         "scenario_folder": str(scenario_folder),
         "wall_time": wall_time,
         "ego_id": ego_id,
         "params": params,
         "ecodrive_kwargs": kwargs,
-        "completion_reason": getattr(result, "completion_reason", None),
+        "completion_reason": completion_reason,
         "sync_returncode": getattr(result, "sync_returncode", None),
         "traffic": getattr(result, "traffic", {}),
         "ego": getattr(result, "ego", {}),
@@ -549,6 +1263,7 @@ def _other_params(
         "ego_tripinfo": ego_tripinfo,
         "tripinfos": getattr(result, "tripinfos", []),
         "summary_records": getattr(result, "summary_records", []),
+        "last_ego_state": last_ego_state,
         "critical_battery_threshold": critical_threshold,
         "battery_below_threshold": (
             final_battery is not None
@@ -559,7 +1274,202 @@ def _other_params(
     other.update(metrics)
     other.update(tripinfo_metrics)
     other.update(speed_metrics)
+    other.update(stop_and_go_metrics)
+    other.update(_ego_state_metrics(last_ego_state))
     return _jsonable(other)
+
+
+def _to_failed_simulation_output(
+    *,
+    params: Dict[str, Any],
+    kwargs: Dict[str, Any],
+    scenario_folder: Path,
+    exc: Exception,
+    wall_time: float,
+    evaluation_id: int,
+) -> SimulationOutput:
+    progress_log_path = kwargs.get("progress_log_file")
+    last_ego_state = getattr(exc, "last_ego_state", {}) or {}
+    other_params = {
+        "simulator": "ECoDriveSimulator",
+        "evaluation_id": evaluation_id,
+        "simulation_status": "failed",
+        "simulation_failed": True,
+        "completion_reason": f"simulation_exception:{type(exc).__name__}",
+        "exception": _exception_metadata(exc),
+        "automated_ecodrive_root": str(AUTOMATED_ECODRIVE_ROOT) if AUTOMATED_ECODRIVE_ROOT else None,
+        "scenario_folder": str(scenario_folder),
+        "wall_time": wall_time,
+        "params": params,
+        "ecodrive_kwargs": kwargs,
+        "progress_log_path": str(progress_log_path) if progress_log_path else None,
+        "last_ego_state": last_ego_state,
+        "critical_battery_threshold": kwargs.get("ego_critical_battery_threshold"),
+        "battery_below_threshold": False,
+        "final_battery_capacity": _fallback_failed_final_battery(kwargs),
+        "total_energy_consumed": None,
+        "ego_mean_speed": 0.0,
+        "ego_stop_and_go_count": 0,
+        "ego_stop_and_go_stop_speed_threshold_mps": kwargs.get(
+            "ego_stop_and_go_stop_speed_threshold_mps"
+        ),
+        "ego_stop_and_go_go_speed_threshold_mps": kwargs.get(
+            "ego_stop_and_go_go_speed_threshold_mps"
+        ),
+    }
+    other_params.update(_ego_state_metrics(last_ego_state))
+    return SimulationOutput(
+        simTime=wall_time,
+        times=[0.0],
+        timestamps={"ego": [0.0]},
+        location={"ego": [(0.0, 0.0, 0.0)]},
+        velocity={"ego": [0.0]},
+        speed={"ego": [0.0]},
+        acceleration={"ego": [0.0]},
+        yaw={"ego": [0.0]},
+        collisions=[],
+        actors={
+            "ego": "ego",
+            "vehicles": [],
+            "pedestrians": [],
+        },
+        otherParams=_jsonable(other_params),
+    )
+
+
+def _fallback_failed_final_battery(kwargs: Dict[str, Any]) -> float:
+    for key in ("ego_current_battery_charge", "ego_max_battery_capacity"):
+        value = _finite_or_none(kwargs.get(key))
+        if value is not None:
+            return max(value, 0.0)
+
+    threshold = _finite_or_none(kwargs.get("ego_critical_battery_threshold"))
+    if threshold is not None:
+        return max(threshold * 2.0, 0.0)
+
+    return 1000.0
+
+
+def _simulation_status(completion_reason: Any) -> str:
+    reason = str(completion_reason or "").lower()
+    if "stalled" in reason or "stopped_on_destination_edge" in reason:
+        return "stalled"
+    return "completed"
+
+
+def _ego_state_metrics(state: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "ego_distance_remaining_m": _finite_or_none(state.get("distance_remaining_m")),
+        "ego_distance_travelled_m": _finite_or_none(state.get("distance_travelled_m")),
+        "ego_distance_reference_source": state.get("distance_reference_source"),
+        "ego_reference_route_length_m": _finite_or_none(
+            state.get("distance_reference_route_length_m")
+        ),
+        "ego_reference_route_projection_error_m": _finite_or_none(
+            state.get("distance_reference_projection_error_m")
+        ),
+        "ego_sumo_odometer_distance_travelled_m": _finite_or_none(
+            state.get("sumo_odometer_distance_travelled_m")
+        ),
+        "ego_sumo_dynamic_route_distance_remaining_m": _finite_or_none(
+            state.get("sumo_dynamic_route_distance_remaining_m")
+        ),
+    }
+
+
+def _state_with_reference_route_metrics(
+    state: Dict[str, Any],
+    *,
+    config: Dict[str, Any],
+    ego_locations: Sequence[Sequence[float]],
+) -> Dict[str, Any]:
+    normalized = dict(state)
+    raw_travelled = _finite_or_none(state.get("distance_travelled_m"))
+    raw_remaining = _finite_or_none(state.get("distance_remaining_m"))
+    normalized["sumo_odometer_distance_travelled_m"] = raw_travelled
+    normalized["sumo_dynamic_route_distance_remaining_m"] = raw_remaining
+
+    final_location = _last_finite_xy(ego_locations)
+    if final_location is None:
+        normalized["distance_reference_source"] = "sumo_dynamic_route_fallback"
+        return normalized
+
+    try:
+        reference = _autoware_reference_path(config)
+        progress, route_length, projection_error = _project_point_onto_polyline(
+            final_location,
+            reference["sumo_centerline"],
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not calculate fixed-route ego distance; keeping SUMO values: %s",
+            exc,
+        )
+        normalized["distance_reference_source"] = "sumo_dynamic_route_fallback"
+        return normalized
+
+    normalized.update(
+        {
+            "distance_travelled_m": progress,
+            "distance_remaining_m": max(0.0, route_length - progress),
+            "distance_reference_route_length_m": route_length,
+            "distance_reference_projection_error_m": projection_error,
+            "distance_reference_source": "autoware_lanelet2_centerline",
+        }
+    )
+    return normalized
+
+
+def _last_finite_xy(locations: Sequence[Sequence[float]]) -> Optional[Tuple[float, float]]:
+    for location in reversed(locations):
+        if len(location) < 2:
+            continue
+        x_value = _finite_or_none(location[0])
+        y_value = _finite_or_none(location[1])
+        if x_value is not None and y_value is not None:
+            return x_value, y_value
+    return None
+
+
+def _project_point_onto_polyline(
+    point: Sequence[float],
+    polyline: Sequence[Sequence[float]],
+) -> Tuple[float, float, float]:
+    if len(polyline) < 2:
+        raise ValueError("The fixed Autoware route must contain at least two points.")
+
+    px, py = float(point[0]), float(point[1])
+    best_distance = float("inf")
+    best_progress = 0.0
+    cumulative = 0.0
+
+    for start, end in zip(polyline, polyline[1:]):
+        ax, ay = float(start[0]), float(start[1])
+        bx, by = float(end[0]), float(end[1])
+        dx, dy = bx - ax, by - ay
+        segment_length = math.hypot(dx, dy)
+        if segment_length <= 0.0:
+            continue
+
+        projection = max(
+            0.0,
+            min(1.0, ((px - ax) * dx + (py - ay) * dy) / (segment_length ** 2)),
+        )
+        projected_x = ax + projection * dx
+        projected_y = ay + projection * dy
+        distance = math.hypot(px - projected_x, py - projected_y)
+        progress = cumulative + projection * segment_length
+        if distance < best_distance or (
+            math.isclose(distance, best_distance, abs_tol=1e-9)
+            and progress > best_progress
+        ):
+            best_distance = distance
+            best_progress = progress
+        cumulative += segment_length
+
+    if not math.isfinite(best_distance):
+        raise ValueError("The fixed Autoware route contains no valid segment.")
+    return float(best_progress), float(cumulative), float(best_distance)
 
 
 def _energy_metrics(energy_df: pd.DataFrame) -> Dict[str, Optional[float]]:
@@ -628,6 +1538,56 @@ def _speed_metrics(
     }
 
 
+def _stop_and_go_metrics(
+    ego_speed: Sequence[float],
+    *,
+    stop_speed_threshold_mps: float,
+    go_speed_threshold_mps: float,
+) -> Dict[str, Any]:
+    """Count completed moving-to-stopped-to-moving cycles using m/s hysteresis."""
+    stop_threshold = float(stop_speed_threshold_mps)
+    go_threshold = float(go_speed_threshold_mps)
+    _validate_stop_and_go_thresholds(stop_threshold, go_threshold)
+
+    count = 0
+    moving_seen = False
+    stopped_after_moving = False
+    for raw_speed in ego_speed:
+        speed = _finite_or_none(raw_speed)
+        if speed is None:
+            continue
+        if not moving_seen:
+            moving_seen = speed > go_threshold
+        elif stopped_after_moving:
+            if speed > go_threshold:
+                count += 1
+                stopped_after_moving = False
+        elif speed < stop_threshold:
+            stopped_after_moving = True
+
+    return {
+        "ego_stop_and_go_count": count,
+        "ego_stop_and_go_stop_speed_threshold_mps": stop_threshold,
+        "ego_stop_and_go_go_speed_threshold_mps": go_threshold,
+    }
+
+
+def _validate_stop_and_go_thresholds(
+    stop_speed_threshold_mps: float,
+    go_speed_threshold_mps: float,
+) -> None:
+    stop_threshold = float(stop_speed_threshold_mps)
+    go_threshold = float(go_speed_threshold_mps)
+    if not math.isfinite(stop_threshold) or not math.isfinite(go_threshold):
+        raise ValueError("The stop-and-go speed thresholds must be finite.")
+    if stop_threshold < 0:
+        raise ValueError("The stop-and-go stop speed threshold must be non-negative.")
+    if go_threshold <= stop_threshold:
+        raise ValueError(
+            "The stop-and-go go speed threshold must be greater than the stop threshold."
+        )
+
+
 def _archive_external_output(result: Any, scenario_folder: Path) -> Optional[str]:
     output_paths = getattr(result, "output_paths", {}) or {}
     roots = [
@@ -642,8 +1602,19 @@ def _archive_external_output(result: Any, scenario_folder: Path) -> Optional[str
     archive = scenario_folder / "output"
     if archive.exists():
         shutil.rmtree(archive)
-    shutil.copytree(source, archive)
+    shutil.copytree(
+        source,
+        archive,
+        ignore=shutil.ignore_patterns(*ARCHIVE_IGNORED_PATTERNS),
+    )
     return str(archive)
+
+
+def _remove_file(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Could not remove temporary ECoDrive log file: %s", path)
 
 
 def _write_result_metadata(
@@ -653,12 +1624,34 @@ def _write_result_metadata(
     kwargs: Dict[str, Any],
     result: Any,
     archived_output: Optional[str],
+    evaluation_id: int,
 ) -> None:
+    stop_and_go_metrics = _stop_and_go_metrics(
+        _result_ego_speed(result),
+        stop_speed_threshold_mps=kwargs.get(
+            "ego_stop_and_go_stop_speed_threshold_mps",
+            DEFAULT_ECODRIVE_CONFIG["ego_stop_and_go_stop_speed_threshold_mps"],
+        ),
+        go_speed_threshold_mps=kwargs.get(
+            "ego_stop_and_go_go_speed_threshold_mps",
+            DEFAULT_ECODRIVE_CONFIG["ego_stop_and_go_go_speed_threshold_mps"],
+        ),
+    )
+    last_ego_state = _state_with_reference_route_metrics(
+        getattr(result, "last_ego_state", {}) or {},
+        config=kwargs,
+        ego_locations=_result_ego_locations(result),
+    )
     metadata = {
+        "evaluation_id": evaluation_id,
+        "simulation_status": _simulation_status(getattr(result, "completion_reason", None)),
+        "simulation_failed": False,
         "params": params,
         "ecodrive_kwargs": kwargs,
         "automated_ecodrive_root": str(AUTOMATED_ECODRIVE_ROOT) if AUTOMATED_ECODRIVE_ROOT else None,
         "archived_output": archived_output,
+        **stop_and_go_metrics,
+        **_ego_state_metrics(last_ego_state),
         "result": {
             "town": getattr(result, "town", None),
             "carla_version": getattr(result, "carla_version", None),
@@ -673,6 +1666,7 @@ def _write_result_metadata(
             "summary_records": getattr(result, "summary_records", []),
             "sync_returncode": getattr(result, "sync_returncode", None),
             "completion_reason": getattr(result, "completion_reason", None),
+            "last_ego_state": last_ego_state,
             "progress_log_path": getattr(result, "progress_log_path", None),
         },
     }
@@ -680,12 +1674,84 @@ def _write_result_metadata(
         json.dump(_jsonable(metadata), handle, indent=2)
 
 
+def _result_ego_locations(result: Any) -> List[tuple]:
+    battery_df = _read_result_csv(result, "battery")
+    emission_df = _read_result_csv(result, "emission")
+    ego_id = _ego_vehicle_id(result, battery_df, emission_df)
+    ego_battery = _filter_vehicle(battery_df, ego_id)
+    if not ego_battery.empty:
+        return _locations_from_frame(ego_battery)
+    return _locations_from_frame(_filter_vehicle(emission_df, ego_id))
+
+
+def _result_ego_speed(result: Any) -> List[float]:
+    battery_df = _read_result_csv(result, "battery")
+    emission_df = _read_result_csv(result, "emission")
+    ego_id = _ego_vehicle_id(result, battery_df, emission_df)
+    ego_battery = _filter_vehicle(battery_df, ego_id)
+    if ego_battery.empty:
+        return []
+    return _numeric_column(ego_battery, ("speed",))
+
+
+def _write_failed_result_metadata(
+    scenario_folder: Path,
+    *,
+    params: Dict[str, Any],
+    kwargs: Dict[str, Any],
+    exc: Exception,
+    wall_time: float,
+    evaluation_id: int,
+) -> None:
+    last_ego_state = getattr(exc, "last_ego_state", {}) or {}
+    metadata = {
+        "evaluation_id": evaluation_id,
+        "simulation_status": "failed",
+        "params": params,
+        "ecodrive_kwargs": kwargs,
+        "automated_ecodrive_root": str(AUTOMATED_ECODRIVE_ROOT) if AUTOMATED_ECODRIVE_ROOT else None,
+        "wall_time": wall_time,
+        "simulation_failed": True,
+        "completion_reason": f"simulation_exception:{type(exc).__name__}",
+        "ego_stop_and_go_count": 0,
+        "ego_stop_and_go_stop_speed_threshold_mps": kwargs.get(
+            "ego_stop_and_go_stop_speed_threshold_mps"
+        ),
+        "ego_stop_and_go_go_speed_threshold_mps": kwargs.get(
+            "ego_stop_and_go_go_speed_threshold_mps"
+        ),
+        "last_ego_state": last_ego_state,
+        **_ego_state_metrics(last_ego_state),
+        "exception": _exception_metadata(exc),
+    }
+    with (scenario_folder / "ecodrive_error.json").open("w", encoding="utf-8") as handle:
+        json.dump(_jsonable(metadata), handle, indent=2)
+
+
+def _exception_metadata(exc: Exception) -> Dict[str, Any]:
+    return {
+        "type": type(exc).__name__,
+        "message": str(exc),
+        "traceback": "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        ),
+    }
+
+
 def _read_result_csv(result: Any, key: str) -> pd.DataFrame:
     csv_paths = getattr(result, "csv_paths", {}) or {}
     path = csv_paths.get(key)
-    if not path or not Path(path).exists():
+    if not path:
         return pd.DataFrame()
-    return pd.read_csv(path)
+
+    csv_path = Path(path)
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return pd.DataFrame()
+
+    try:
+        return pd.read_csv(csv_path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
 
 
 def _energy_dataframe(result: Any) -> pd.DataFrame:
@@ -789,10 +1855,27 @@ def _fit_length(values: List[Any], length: int, *, fill: Any) -> List[Any]:
     return values + [fill for _ in range(length - len(values))]
 
 
-def _scenario_name(index: int, params: Dict[str, Any]) -> str:
+def _next_evaluation_id(run_root: Path, run_id: str) -> int:
+    key = f"{run_root}:{run_id}"
+    if key not in _EVALUATION_COUNTERS:
+        logs_dir = run_root / f"executed-simulations-ecodrive-{run_id}"
+        existing_ids = []
+        for scenario_folder in logs_dir.glob("ecodrive_eval_*"):
+            try:
+                existing_ids.append(int(scenario_folder.name.split("_")[2]))
+            except (IndexError, ValueError):
+                continue
+        _EVALUATION_COUNTERS[key] = max(existing_ids, default=-1) + 1
+
+    evaluation_id = _EVALUATION_COUNTERS.get(key, 0)
+    _EVALUATION_COUNTERS[key] = evaluation_id + 1
+    return evaluation_id
+
+
+def _scenario_name(evaluation_id: int, params: Dict[str, Any]) -> str:
     encoded = json.dumps(_jsonable(params), sort_keys=True).encode("utf-8")
     digest = hashlib.sha1(encoded).hexdigest()[:8]
-    return f"ecodrive_{index:04d}_{digest}"
+    return f"ecodrive_eval_{evaluation_id:06d}_{digest}"
 
 
 def _deep_update(target: Dict[str, Any], source: Dict[str, Any]) -> None:

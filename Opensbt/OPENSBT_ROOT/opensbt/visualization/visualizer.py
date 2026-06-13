@@ -183,7 +183,15 @@ def write_simout(path, pop, accessor = "SO"):
         simout = pop.get(accessor)[i]
         if simout != None and not isinstance(simout, (float, int, np.number)):
             simout_dumped = simout.to_json()
-            with open(path + os.sep + f'simout{f"_S{param_v_chain}" if param_v_chain is not None else ""}.json', 'w') as f:
+            metadata = _simulation_metadata_from_output(simout)
+            evaluation_id = metadata.get("evaluation_id")
+            evaluation_token = (
+                f"E{int(evaluation_id):06d}"
+                if evaluation_id is not None
+                else f"I{i:06d}"
+            )
+            file_name = f'simout_{evaluation_token}{f"_S{param_v_chain}" if param_v_chain is not None else ""}.json'
+            with open(path + os.sep + file_name, 'w') as f:
                 f.write(simout_dumped)
 
     # FOR NOW COMMENTED OUT; NOT NEEDED AS DATA INCLUDED IN OUTPUT
@@ -256,6 +264,17 @@ def write_summary_results(res, save_folder):
     n_all_dup_free = len(duplicate_free(all_population))
     n_crit_best_dup_free = len(duplicate_free(critical_best))
     n_best_dup_free = len(duplicate_free(best_population))
+    simulation_statuses = [
+        _simulation_metadata(ind).get("simulation_status")
+        for ind in all_population
+    ]
+    n_simulation_failed = simulation_statuses.count("failed")
+    n_simulation_stalled = simulation_statuses.count("stalled")
+    n_simulation_completed = simulation_statuses.count("completed")
+    n_simulation_recorded = (
+        n_simulation_completed + n_simulation_stalled + n_simulation_failed
+    )
+    n_simulation_unclassified = len(all_population) - n_simulation_recorded
 
     # write down when first critical solutions found + which fitness value it has
     iter_crit, inds_critical = res.get_first_critical()
@@ -271,6 +290,11 @@ def write_summary_results(res, save_folder):
 
         write_to.writerow(['Number All Scenarios', len(all_population)])
         write_to.writerow(['Number All Scenarios (duplicate free)', n_all_dup_free])
+        write_to.writerow(['Number Recorded Simulation Evaluations', n_simulation_recorded])
+        write_to.writerow(['Number Completed Simulations', n_simulation_completed])
+        write_to.writerow(['Number Stalled Simulations', n_simulation_stalled])
+        write_to.writerow(['Number Failed Simulations', n_simulation_failed])
+        write_to.writerow(['Number Unclassified Simulation Evaluations', n_simulation_unclassified])
 
         write_to.writerow(['Number Best Critical Scenarios', len(critical_best)])
         write_to.writerow(['Number Best Critical Scenarios (duplicate free)', n_crit_best_dup_free])
@@ -544,29 +568,45 @@ def plot_multi_objective_space(res, n_obj, save_folder_objective, objective_name
 
                 
                     pop_f_x = all_population.get("F")[:, axis_x]
+                    pop_f_x = pop_f_x[np.isfinite(pop_f_x)]
+                    if len(pop_f_x) == 0:
+                        continue
 
                     # Remove values close to PENALTY_MAX
                     mask_max = ~((pop_f_x <= PENALTY_MAX) & (pop_f_x >= 0.5 * PENALTY_MAX))
                     clean_pop_x_max = pop_f_x[mask_max]
 
                     if(len(clean_pop_x_max) == 0):
-                        return
+                        clean_pop_x_max = pop_f_x
                     
                     max_x_f_ind = np.max(clean_pop_x_max)
 
                     # Remove values close to PENALTY_MIN
                     mask_min = ~((pop_f_x <= PENALTY_MIN) & (pop_f_x >= 0.5 * PENALTY_MIN))
                     clean_pop_x_min = pop_f_x[mask_min]
+                    if(len(clean_pop_x_min) == 0):
+                        clean_pop_x_min = pop_f_x
                     min_x_f_ind = np.min(clean_pop_x_min)
 
                     pop_f_y = all_population.get("F")[:,axis_y]
+                    pop_f_y = pop_f_y[np.isfinite(pop_f_y)]
+                    if len(pop_f_y) == 0:
+                        continue
                     clean_pop_y = np.delete(pop_f_y, np.where(pop_f_y == PENALTY_MAX))
+                    if len(clean_pop_y) == 0:
+                        clean_pop_y = pop_f_y
                     max_y_f_ind = max(clean_pop_y)
                     clean_pop_y = np.delete(pop_f_y, np.where(pop_f_y == PENALTY_MIN))
+                    if len(clean_pop_y) == 0:
+                        clean_pop_y = pop_f_y
                     min_y_f_ind = min(clean_pop_y)
 
                     eta_x = abs(max_x_f_ind - min_x_f_ind) / 10
                     eta_y = abs(max_y_f_ind- min_y_f_ind) / 10
+                    if eta_x == 0:
+                        eta_x = max(abs(max_x_f_ind), 1.0) * 0.05
+                    if eta_y == 0:
+                        eta_y = max(abs(max_y_f_ind), 1.0) * 0.05
                     
                     plt.xlim(min_x_f_ind - eta_x, max_x_f_ind  + eta_x)
                     plt.ylim(min_y_f_ind - eta_y, max_y_f_ind  + eta_y)
@@ -689,7 +729,17 @@ def optimal_individuals(res, save_folder):
             header.append(f"Fitness_"+ objective_names[i])
 
         # column to indicate wheter individual is critical or not 
-        header.append(f"Critical")
+        header.extend([
+            "Critical",
+            "Evaluation_ID",
+            "Simulation_Status",
+            "Completion_Reason",
+            "Simulation_Failed",
+            "Ego_Distance_Remaining_M",
+            "Ego_Distance_Travelled_M",
+            "Ego_Stop_And_Go_Count",
+            "Scenario_Folder",
+        ])
 
         write_to.writerow(header)
 
@@ -698,8 +748,12 @@ def optimal_individuals(res, save_folder):
         for index in range(len(clean_pop)):
             row = [index]
             row.extend([f"%.{OUTPUT_PRECISION}f" % X_i for X_i in clean_pop.get("X")[index]])
-            row.extend([f"%.{OUTPUT_PRECISION}f" % F_i for F_i in clean_pop.get("F")[index]])
+            row.extend([
+                f"%.{OUTPUT_PRECISION}f" % F_i
+                for F_i in _reported_fitness(problem, clean_pop.get("F")[index])
+            ])
             row.extend(["%i" % clean_pop.get("CB")[index]])
+            row.extend(_simulation_metadata_row(clean_pop[index]))
             write_to.writerow(row)
         f.close()
 
@@ -718,8 +772,17 @@ def all_individuals(res, save_folder):
             header.append(design_names[i])
         for i in range(problem.n_obj):
             header.append(f"Fitness_{objective_names[i]}")
-        # column to indicate wheter individual is critical or not 
-        header.append(f"Critical")
+        header.extend([
+            "Critical",
+            "Evaluation_ID",
+            "Simulation_Status",
+            "Completion_Reason",
+            "Simulation_Failed",
+            "Ego_Distance_Remaining_M",
+            "Ego_Distance_Travelled_M",
+            "Ego_Stop_And_Go_Count",
+            "Scenario_Folder",
+        ])
 
         write_to.writerow(header)
 
@@ -728,10 +791,87 @@ def all_individuals(res, save_folder):
         for index, ind in enumerate(all_individuals):
             row = [index]
             row.extend([f"%.{OUTPUT_PRECISION}f" % X_i for X_i in ind.get("X")])
-            row.extend([f"%.{OUTPUT_PRECISION}f" % F_i for F_i in ind.get("F")])
+            row.extend([
+                f"%.{OUTPUT_PRECISION}f" % F_i
+                for F_i in _reported_fitness(problem, ind.get("F"))
+            ])
             row.extend(["%i" % ind.get("CB")])
+            row.extend(_simulation_metadata_row(ind))
             write_to.writerow(row)
         f.close()
+
+
+def failed_individuals(res, save_folder):
+    """Write every failed simulation evaluation, including repeated input combinations."""
+    problem = res.problem
+    objective_names = problem.objective_names
+    failed = [
+        ind
+        for ind in res.obtain_archive()
+        if _simulation_metadata(ind).get("simulation_failed") is True
+    ]
+
+    with open(save_folder + 'failed_testcases.csv', 'w', encoding='UTF8', newline='') as f:
+        write_to = csv.writer(f)
+        header = ['Index']
+        header.extend(problem.design_names)
+        header.extend([f"Fitness_{name}" for name in objective_names])
+        header.extend([
+            "Critical",
+            "Evaluation_ID",
+            "Simulation_Status",
+            "Completion_Reason",
+            "Simulation_Failed",
+            "Ego_Distance_Remaining_M",
+            "Ego_Distance_Travelled_M",
+            "Ego_Stop_And_Go_Count",
+            "Scenario_Folder",
+        ])
+        write_to.writerow(header)
+
+        for index, ind in enumerate(failed):
+            row = [index]
+            row.extend([f"%.{OUTPUT_PRECISION}f" % X_i for X_i in ind.get("X")])
+            row.extend([
+                f"%.{OUTPUT_PRECISION}f" % F_i
+                for F_i in _reported_fitness(problem, ind.get("F"))
+            ])
+            row.extend(["%i" % ind.get("CB")])
+            row.extend(_simulation_metadata_row(ind))
+            write_to.writerow(row)
+
+
+def _simulation_metadata(ind, accessor="SO"):
+    return _simulation_metadata_from_output(ind.get(accessor))
+
+
+def _simulation_metadata_from_output(simout):
+    if simout is None or isinstance(simout, (float, int, np.number)):
+        return {}
+    return getattr(simout, "otherParams", {}) or {}
+
+
+def _simulation_metadata_row(ind):
+    metadata = _simulation_metadata(ind)
+    return [
+        metadata.get("evaluation_id", ""),
+        metadata.get("simulation_status", ""),
+        metadata.get("completion_reason", ""),
+        metadata.get("simulation_failed", ""),
+        metadata.get("ego_distance_remaining_m", ""),
+        metadata.get("ego_distance_travelled_m", ""),
+        metadata.get("ego_stop_and_go_count", ""),
+        metadata.get("scenario_folder", ""),
+    ]
+
+
+def _reported_fitness(problem, values):
+    """Convert pymoo's minimization vector back to declared fitness directions."""
+    directions = tuple(problem.fitness_function.min_or_max)
+    return [
+        -value if direction == "max" else value
+        for value, direction in zip(values, directions)
+    ]
 
 def all_individuals_lohifi_predictions_certainty(res, save_folder):
     import math
