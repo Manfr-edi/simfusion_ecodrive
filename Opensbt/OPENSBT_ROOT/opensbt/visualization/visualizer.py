@@ -729,17 +729,7 @@ def optimal_individuals(res, save_folder):
             header.append(f"Fitness_"+ objective_names[i])
 
         # column to indicate wheter individual is critical or not 
-        header.extend([
-            "Critical",
-            "Evaluation_ID",
-            "Simulation_Status",
-            "Completion_Reason",
-            "Simulation_Failed",
-            "Ego_Distance_Remaining_M",
-            "Ego_Distance_Travelled_M",
-            "Ego_Stop_And_Go_Count",
-            "Scenario_Folder",
-        ])
+        header.extend(_simulation_metadata_header(problem))
 
         write_to.writerow(header)
 
@@ -753,7 +743,7 @@ def optimal_individuals(res, save_folder):
                 for F_i in _reported_fitness(problem, clean_pop.get("F")[index])
             ])
             row.extend(["%i" % clean_pop.get("CB")[index]])
-            row.extend(_simulation_metadata_row(clean_pop[index]))
+            row.extend(_simulation_metadata_row(clean_pop[index], problem))
             write_to.writerow(row)
         f.close()
 
@@ -772,17 +762,7 @@ def all_individuals(res, save_folder):
             header.append(design_names[i])
         for i in range(problem.n_obj):
             header.append(f"Fitness_{objective_names[i]}")
-        header.extend([
-            "Critical",
-            "Evaluation_ID",
-            "Simulation_Status",
-            "Completion_Reason",
-            "Simulation_Failed",
-            "Ego_Distance_Remaining_M",
-            "Ego_Distance_Travelled_M",
-            "Ego_Stop_And_Go_Count",
-            "Scenario_Folder",
-        ])
+        header.extend(_simulation_metadata_header(problem))
 
         write_to.writerow(header)
 
@@ -796,7 +776,7 @@ def all_individuals(res, save_folder):
                 for F_i in _reported_fitness(problem, ind.get("F"))
             ])
             row.extend(["%i" % ind.get("CB")])
-            row.extend(_simulation_metadata_row(ind))
+            row.extend(_simulation_metadata_row(ind, problem))
             write_to.writerow(row)
         f.close()
 
@@ -816,17 +796,7 @@ def failed_individuals(res, save_folder):
         header = ['Index']
         header.extend(problem.design_names)
         header.extend([f"Fitness_{name}" for name in objective_names])
-        header.extend([
-            "Critical",
-            "Evaluation_ID",
-            "Simulation_Status",
-            "Completion_Reason",
-            "Simulation_Failed",
-            "Ego_Distance_Remaining_M",
-            "Ego_Distance_Travelled_M",
-            "Ego_Stop_And_Go_Count",
-            "Scenario_Folder",
-        ])
+        header.extend(_simulation_metadata_header(problem))
         write_to.writerow(header)
 
         for index, ind in enumerate(failed):
@@ -837,7 +807,7 @@ def failed_individuals(res, save_folder):
                 for F_i in _reported_fitness(problem, ind.get("F"))
             ])
             row.extend(["%i" % ind.get("CB")])
-            row.extend(_simulation_metadata_row(ind))
+            row.extend(_simulation_metadata_row(ind, problem))
             write_to.writerow(row)
 
 
@@ -851,9 +821,31 @@ def _simulation_metadata_from_output(simout):
     return getattr(simout, "otherParams", {}) or {}
 
 
-def _simulation_metadata_row(ind):
+def _simulation_metadata_header(problem=None):
+    header = [
+        "Critical",
+        "Evaluation_ID",
+        "Simulation_Status",
+        "Completion_Reason",
+        "Simulation_Failed",
+        "Ego_Distance_Remaining_M",
+        "Ego_Distance_Travelled_M",
+        "Ego_Stop_And_Go_Count",
+        "Scenario_Folder",
+    ]
+    if _include_ecodrive_energy_metadata(problem):
+        header.extend([
+            "Net_Energy_Consumed",
+            "Free_Flow_Net_Energy_Consumed",
+            "Net_Energy_Delta_Over_Free_Flow",
+            "Final_Battery_Capacity",
+        ])
+    return header
+
+
+def _simulation_metadata_row(ind, problem=None):
     metadata = _simulation_metadata(ind)
-    return [
+    row = [
         metadata.get("evaluation_id", ""),
         metadata.get("simulation_status", ""),
         metadata.get("completion_reason", ""),
@@ -863,6 +855,30 @@ def _simulation_metadata_row(ind):
         metadata.get("ego_stop_and_go_count", ""),
         metadata.get("scenario_folder", ""),
     ]
+    if _include_ecodrive_energy_metadata(problem):
+        row.extend([
+            _formatted_metadata_float(metadata, "reported_net_energy_consumed"),
+            _formatted_metadata_float(metadata, "free_flow_net_energy_consumed"),
+            _formatted_metadata_float(metadata, "net_energy_delta_over_free_flow"),
+            _formatted_metadata_float(metadata, "final_battery_capacity"),
+        ])
+    return row
+
+
+def _include_ecodrive_energy_metadata(problem):
+    objective_names = getattr(problem, "objective_names", ())
+    return "Net energy consumed" in objective_names
+
+
+def _formatted_metadata_float(metadata, key):
+    value = metadata.get(key)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not np.isfinite(number):
+        return ""
+    return f"%.{OUTPUT_PRECISION}f" % number
 
 
 def _reported_fitness(problem, values):

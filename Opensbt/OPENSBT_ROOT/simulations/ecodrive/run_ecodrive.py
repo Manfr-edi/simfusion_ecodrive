@@ -55,6 +55,7 @@ from opensbt.problem.adas_problem import ADASProblem
 from opensbt.utils.wandb import logging_callback_archive, wandb_log_artifact, wandb_log_folder
 from simulations.ecodrive.ecodrive_fitness import CriticalECoDriveBattery, FitnessECoDriveBattery
 from simulations.ecodrive.ecodrive_simulation import (
+    PARAMETER_ALIASES,
     ECoDriveSimulator,
     autoware_path_edge_report,
     traffic_congestion_edge_candidates,
@@ -73,6 +74,7 @@ VEHICLE_COUNT_STEP = 10
 EDGE_INDEX_SUFFIX = "_edge_index"
 ORDINAL_EDGE_INDEX_VARIABLES = {"ego_source_near_congestion_index"}
 LOCAL_EDGE_CANDIDATE_COUNT = 10
+FREE_FLOW_BASELINE_FILENAME = "free_flow_baseline.json"
 
 
 def wandb_tag(name, value):
@@ -387,7 +389,7 @@ def parse_args():
     parser.add_argument("--population_size", type=int, default=2)
     parser.add_argument("--n_generations", type=int, default=None)
     parser.add_argument("--maximal_execution_time", type=str, default=None)
-    parser.add_argument("--algo", choices=["ga", "ps", "rand", "art"], default="rand")
+    parser.add_argument("--algo", choices=["ga", "ps", "rand", "art"], default="ga")
     parser.add_argument("--results_folder", type=str, default=str(ECODRIVE_SIM_DIR / "results"))
     parser.add_argument(
         "--write_gifs",
@@ -435,6 +437,17 @@ def parse_args():
     )
     parser.add_argument("--simulation_time", type=float, default=600.0)
     parser.add_argument("--sampling_time", type=float, default=0.1)
+    parser.add_argument(
+        "--free_flow_net_energy_consumed",
+        "--free_flow_energy_consumed",
+        dest="free_flow_net_energy_consumed",
+        type=float,
+        default=None,
+        help=(
+            "Reuse a known free-flow net-energy baseline instead of running the "
+            "automatic preliminary simulation with traffic_vehicle_count=0."
+        ),
+    )
     parser.add_argument(
         "--list_autoware_path_edges",
         action="store_true",
@@ -487,6 +500,107 @@ def build_optimizer(problem, algo, config, sampling_type=None, repair=None):
         callback=logging_callback_archive,
         **optimizer_kwargs,
     )
+
+
+def canonical_variable_name(name):
+    return PARAMETER_ALIASES.get(name, name)
+
+
+def free_flow_baseline_input(variable_names, xl, scenario_defaults):
+    baseline_names = list(variable_names)
+    baseline_values = [
+        free_flow_baseline_value(name, index, xl, scenario_defaults)
+        for index, name in enumerate(baseline_names)
+    ]
+
+    if not any(
+        canonical_variable_name(name) == "traffic_vehicle_count"
+        for name in baseline_names
+    ):
+        baseline_names.append("traffic_vehicle_count")
+        baseline_values.append(0.0)
+
+    return baseline_names, baseline_values
+
+
+def free_flow_baseline_value(name, index, xl, scenario_defaults):
+    canonical_name = canonical_variable_name(name)
+    if canonical_name == "traffic_vehicle_count":
+        return 0.0
+
+    for key in (name, canonical_name):
+        if key not in scenario_defaults:
+            continue
+        value = finite_float(scenario_defaults.get(key))
+        if value is not None:
+            return value
+
+    return float(xl[index])
+
+
+def finite_float(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def run_free_flow_baseline(args, scenario_defaults, fitness_function):
+    if args.free_flow_net_energy_consumed is not None:
+        fitness_function.set_free_flow_net_energy_consumed(
+            args.free_flow_net_energy_consumed
+        )
+        return {
+            "source": "cli",
+            "net_energy_consumed": float(args.free_flow_net_energy_consumed),
+            "formula": "(net_energy_consumed - free_flow_net_energy_consumed) / free_flow_net_energy_consumed",
+        }
+
+    variable_names, values = free_flow_baseline_input(
+        args.variables,
+        args.xl,
+        scenario_defaults,
+    )
+    log.info(
+        "Running free-flow baseline with variables=%s values=%s",
+        variable_names,
+        values,
+    )
+    simout = ECoDriveSimulator.simulate(
+        [values],
+        variable_names,
+        args.scenario,
+        sim_time=args.simulation_time,
+        time_step=args.sampling_time,
+        do_visualize=False,
+    )[0]
+    net_energy_consumed = fitness_function.net_energy_consumed(simout)
+    fitness_function.set_free_flow_net_energy_consumed(net_energy_consumed)
+
+    other_params = getattr(simout, "otherParams", {}) or {}
+    return {
+        "source": "simulated_free_flow",
+        "net_energy_consumed": net_energy_consumed,
+        "formula": "(net_energy_consumed - free_flow_net_energy_consumed) / free_flow_net_energy_consumed",
+        "variables": variable_names,
+        "values": values,
+        "evaluation_id": other_params.get("evaluation_id"),
+        "simulation_status": other_params.get("simulation_status"),
+        "completion_reason": other_params.get("completion_reason"),
+        "simulation_failed": other_params.get("simulation_failed"),
+        "scenario_folder": other_params.get("scenario_folder"),
+    }
+
+
+def write_free_flow_baseline_metadata(save_folder, metadata):
+    if not metadata:
+        return
+    path = Path(save_folder) / FREE_FLOW_BASELINE_FILENAME
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2, sort_keys=True)
 
 
 args = parse_args()
@@ -781,6 +895,21 @@ Path(save_folder).mkdir(parents=True, exist_ok=True)
 os.environ["OPENSBT_RUN_ROOT"] = save_folder
 os.environ["OPENSBT_RUN_ID"] = run_id
 
+free_flow_baseline = run_free_flow_baseline(
+    args,
+    scenario_defaults,
+    fitness_function,
+)
+log.info(
+    "Free-flow net energy baseline: %.6f",
+    free_flow_baseline["net_energy_consumed"],
+)
+if not args.no_wandb:
+    wandb.config.update(
+        {"free_flow_baseline": free_flow_baseline},
+        allow_val_change=True,
+    )
+
 res = optimizer.run()
 print("\nOptimization completed.")
 
@@ -792,6 +921,7 @@ try:
         params=optimizer.parameters,
         save_folder=optimizer.save_folder,
     )
+    write_free_flow_baseline_metadata(save_folder, free_flow_baseline)
 finally:
     os.chdir(previous_cwd)
 

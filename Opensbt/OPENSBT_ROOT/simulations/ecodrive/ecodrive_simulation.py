@@ -1171,13 +1171,14 @@ def _to_simulation_output(
     acceleration = _fit_length(acceleration, len(times), fill=0.0)
     yaw = _fit_length(yaw, len(times), fill=0.0)
 
+    energy_metric_df = ego_battery if not ego_battery.empty else energy_df
     other_params = _other_params(
         result,
         params=params,
         kwargs=kwargs,
         scenario_folder=scenario_folder,
         wall_time=wall_time,
-        energy_df=energy_df,
+        energy_df=energy_metric_df,
         ego_id=ego_id,
         ego_speed=speed,
         ego_locations=reference_locations,
@@ -1307,7 +1308,11 @@ def _to_failed_simulation_output(
         "critical_battery_threshold": kwargs.get("ego_critical_battery_threshold"),
         "battery_below_threshold": False,
         "final_battery_capacity": _fallback_failed_final_battery(kwargs),
+        "energy_consumed": None,
+        "energy_regenerated": None,
         "total_energy_consumed": None,
+        "total_energy_regenerated": None,
+        "net_energy_consumed": None,
         "ego_mean_speed": 0.0,
         "ego_stop_and_go_count": 0,
         "ego_stop_and_go_stop_speed_threshold_mps": kwargs.get(
@@ -1476,7 +1481,10 @@ def _energy_metrics(energy_df: pd.DataFrame) -> Dict[str, Optional[float]]:
     if energy_df.empty:
         return {
             "energy_consumed": None,
+            "energy_regenerated": None,
             "total_energy_consumed": None,
+            "total_energy_regenerated": None,
+            "net_energy_consumed": None,
             "initial_battery_capacity": None,
             "final_battery_capacity": None,
             "min_battery_capacity": None,
@@ -1484,15 +1492,41 @@ def _energy_metrics(energy_df: pd.DataFrame) -> Dict[str, Optional[float]]:
 
     metrics = {}
     if "energyConsumed" in energy_df:
-        metrics["energy_consumed"] = _finite_or_none(energy_df["energyConsumed"].sum())
+        metrics["energy_consumed"] = _finite_or_none(_numeric_series_sum(energy_df["energyConsumed"]))
+    if "energyRegenerated" in energy_df:
+        metrics["energy_regenerated"] = _finite_or_none(_numeric_series_sum(energy_df["energyRegenerated"]))
     if "totalEnergyConsumed" in energy_df:
-        metrics["total_energy_consumed"] = _finite_or_none(energy_df["totalEnergyConsumed"].iloc[-1])
+        metrics["total_energy_consumed"] = _finite_or_none(_numeric_series_last(energy_df["totalEnergyConsumed"]))
+    if "totalEnergyRegenerated" in energy_df:
+        metrics["total_energy_regenerated"] = _finite_or_none(_numeric_series_last(energy_df["totalEnergyRegenerated"]))
+    consumed = _first_metric(metrics, "total_energy_consumed", "energy_consumed")
+    regenerated = _first_metric(metrics, "total_energy_regenerated", "energy_regenerated")
+    if consumed is not None and regenerated is not None:
+        metrics["net_energy_consumed"] = _finite_or_none(consumed - regenerated)
     if "actualBatteryCapacity" in energy_df:
         battery = pd.to_numeric(energy_df["actualBatteryCapacity"], errors="coerce").dropna()
         metrics["initial_battery_capacity"] = _finite_or_none(battery.iloc[0]) if not battery.empty else None
         metrics["final_battery_capacity"] = _finite_or_none(battery.iloc[-1]) if not battery.empty else None
         metrics["min_battery_capacity"] = _finite_or_none(battery.min()) if not battery.empty else None
     return metrics
+
+
+def _first_metric(metrics: Dict[str, Optional[float]], *keys: str) -> Optional[float]:
+    for key in keys:
+        value = metrics.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _numeric_series_sum(series: pd.Series) -> Optional[float]:
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    return float(values.sum()) if not values.empty else None
+
+
+def _numeric_series_last(series: pd.Series) -> Optional[float]:
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    return float(values.iloc[-1]) if not values.empty else None
 
 
 def _tripinfo_metrics(ego_tripinfo: Dict[str, Any]) -> Dict[str, Optional[float]]:

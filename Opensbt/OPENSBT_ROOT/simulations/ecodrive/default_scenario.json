@@ -19,7 +19,7 @@
     "ego_destination_edge": "-26.0.00",
     "ego_energy_model": "Energy",
     "ego_max_battery_capacity": 75000,
-    "ego_current_battery_charge": 680,
+    "ego_current_battery_charge": 3750,
     "ego_critical_battery_threshold": 500,
     "ego_stall_timeout": 300.0,
     "ego_stall_speed_threshold": 0.05,

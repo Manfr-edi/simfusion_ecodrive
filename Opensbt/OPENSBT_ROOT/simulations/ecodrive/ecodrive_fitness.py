@@ -8,23 +8,56 @@ from opensbt.simulation.simulator import SimulationOutput
 
 
 class FitnessECoDriveBattery(Fitness):
+    def __init__(self, free_flow_net_energy_consumed: Optional[float] = None):
+        self.free_flow_net_energy_consumed = free_flow_net_energy_consumed
+
     @property
     def min_or_max(self):
-        return "min", "max", "min"
+        return "max", "max", "min"
 
     @property
     def name(self):
-        return "Final battery capacity", "Mean ego speed", "Traffic vehicle count"
+        return "Net energy consumed", "Mean ego speed", "Traffic vehicle count"
 
     def eval(self, simout: SimulationOutput, **kwargs) -> Tuple[float, float, float]:
-        final_battery = _metric(simout, "final_battery_capacity")
+        net_energy_consumed = _net_energy_consumed(simout)
+        self._record_energy_reporting_metrics(simout, net_energy_consumed)
         mean_speed = _metric(simout, "ego_mean_speed") # stop-and-go
         traffic_vehicle_count = _traffic_vehicle_count(simout)
-        if final_battery is None:
-            final_battery = _fallback_final_battery(simout)
         if mean_speed is None:
             mean_speed = 0.0
-        return final_battery, mean_speed, traffic_vehicle_count
+        return net_energy_consumed, mean_speed, traffic_vehicle_count
+
+    def set_free_flow_net_energy_consumed(self, value: float) -> None:
+        free_flow_net_energy = _finite_float(value)
+        if free_flow_net_energy is None or free_flow_net_energy <= 0.0:
+            raise ValueError(
+                "free_flow_net_energy_consumed must be a finite positive value."
+            )
+        self.free_flow_net_energy_consumed = free_flow_net_energy
+
+    @staticmethod
+    def net_energy_consumed(simout: SimulationOutput) -> float:
+        return _net_energy_consumed(simout)
+
+    def _record_energy_reporting_metrics(
+        self,
+        simout: SimulationOutput,
+        net_energy_consumed: float,
+    ) -> None:
+        other_params = getattr(simout, "otherParams", None)
+        if not isinstance(other_params, dict):
+            return
+
+        other_params["reported_net_energy_consumed"] = net_energy_consumed
+        free_flow_net_energy = _finite_float(self.free_flow_net_energy_consumed)
+        if free_flow_net_energy is None or free_flow_net_energy <= 0.0:
+            return
+
+        other_params["free_flow_net_energy_consumed"] = free_flow_net_energy
+        other_params["net_energy_delta_over_free_flow"] = (
+            net_energy_consumed - free_flow_net_energy
+        ) / free_flow_net_energy
 
 
 class CriticalECoDriveBattery(Critical):
@@ -58,26 +91,37 @@ def _metric(simout: SimulationOutput, name: str) -> Optional[float]:
     return _finite_float(simout.otherParams.get(name))
 
 
-def _fallback_final_battery(simout: SimulationOutput) -> float:
-    other_params = getattr(simout, "otherParams", {}) or {}
+def _net_energy_consumed(simout: SimulationOutput) -> float:
+    value = _metric(simout, "net_energy_consumed")
+    if value is not None:
+        return value
 
-    for key in ("initial_battery_capacity", "ego_current_battery_charge"):
-        value = _finite_float(other_params.get(key))
+    consumed = _first_metric(simout, "total_energy_consumed", "energy_consumed")
+    regenerated = _first_metric(
+        simout,
+        "total_energy_regenerated",
+        "energy_regenerated",
+    )
+    if consumed is not None and regenerated is not None:
+        return consumed - regenerated
+
+    if consumed is not None:
+        return consumed
+
+    initial_battery = _metric(simout, "initial_battery_capacity")
+    final_battery = _metric(simout, "final_battery_capacity")
+    if initial_battery is not None and final_battery is not None:
+        return initial_battery - final_battery
+
+    return 0.0
+
+
+def _first_metric(simout: SimulationOutput, *keys: str) -> Optional[float]:
+    for key in keys:
+        value = _metric(simout, key)
         if value is not None:
-            return max(value, 0.0)
-
-    ecodrive_kwargs = other_params.get("ecodrive_kwargs")
-    if isinstance(ecodrive_kwargs, dict):
-        for key in ("ego_current_battery_charge", "ego_max_battery_capacity"):
-            value = _finite_float(ecodrive_kwargs.get(key))
-            if value is not None:
-                return max(value, 0.0)
-
-    threshold = _finite_float(other_params.get("critical_battery_threshold"))
-    if threshold is not None:
-        return max(threshold * 2.0, 0.0)
-
-    return 1000.0
+            return value
+    return None
 
 
 def _traffic_vehicle_count(simout: SimulationOutput) -> float:
