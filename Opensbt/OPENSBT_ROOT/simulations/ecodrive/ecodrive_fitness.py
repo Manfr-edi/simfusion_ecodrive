@@ -8,8 +8,15 @@ from opensbt.simulation.simulator import SimulationOutput
 
 
 class FitnessECoDriveBattery(Fitness):
-    def __init__(self, free_flow_net_energy_consumed: Optional[float] = None):
+    def __init__(
+        self,
+        free_flow_net_energy_consumed: Optional[float] = None,
+        free_flow_ego_mean_speed: Optional[float] = None,
+        free_flow_ego_trip_mean_speed: Optional[float] = None,
+    ):
         self.free_flow_net_energy_consumed = free_flow_net_energy_consumed
+        self.free_flow_ego_mean_speed = free_flow_ego_mean_speed
+        self.free_flow_ego_trip_mean_speed = free_flow_ego_trip_mean_speed
 
     @property
     def min_or_max(self):
@@ -24,6 +31,8 @@ class FitnessECoDriveBattery(Fitness):
         self._record_energy_reporting_metrics(simout, net_energy_consumed)
         mean_speed = _metric(simout, "ego_mean_speed") # stop-and-go
         traffic_vehicle_count = _traffic_vehicle_count(simout)
+        if net_energy_consumed is None:
+            net_energy_consumed = float("-inf")
         if mean_speed is None:
             mean_speed = 0.0
         return net_energy_consumed, mean_speed, traffic_vehicle_count
@@ -36,17 +45,37 @@ class FitnessECoDriveBattery(Fitness):
             )
         self.free_flow_net_energy_consumed = free_flow_net_energy
 
+    def set_free_flow_ego_mean_speed(self, value: float) -> None:
+        free_flow_mean_speed = _finite_float(value)
+        if free_flow_mean_speed is None or free_flow_mean_speed <= 0.0:
+            raise ValueError(
+                "free_flow_ego_mean_speed must be a finite positive value."
+            )
+        self.free_flow_ego_mean_speed = free_flow_mean_speed
+
+    def set_free_flow_ego_trip_mean_speed(self, value: float) -> None:
+        free_flow_trip_mean_speed = _finite_float(value)
+        if free_flow_trip_mean_speed is None or free_flow_trip_mean_speed <= 0.0:
+            raise ValueError(
+                "free_flow_ego_trip_mean_speed must be a finite positive value."
+            )
+        self.free_flow_ego_trip_mean_speed = free_flow_trip_mean_speed
+
     @staticmethod
-    def net_energy_consumed(simout: SimulationOutput) -> float:
+    def net_energy_consumed(simout: SimulationOutput) -> Optional[float]:
         return _net_energy_consumed(simout)
 
     def _record_energy_reporting_metrics(
         self,
         simout: SimulationOutput,
-        net_energy_consumed: float,
+        net_energy_consumed: Optional[float],
     ) -> None:
         other_params = getattr(simout, "otherParams", None)
         if not isinstance(other_params, dict):
+            return
+
+        net_energy_consumed = _finite_float(net_energy_consumed)
+        if net_energy_consumed is None:
             return
 
         other_params["reported_net_energy_consumed"] = net_energy_consumed
@@ -58,6 +87,34 @@ class FitnessECoDriveBattery(Fitness):
         other_params["net_energy_delta_over_free_flow"] = (
             net_energy_consumed - free_flow_net_energy
         ) / free_flow_net_energy
+
+        mean_speed = _metric(simout, "ego_mean_speed")
+        free_flow_mean_speed = _finite_float(self.free_flow_ego_mean_speed)
+        if (
+            mean_speed is None
+            or free_flow_mean_speed is None
+            or free_flow_mean_speed <= 0.0
+        ):
+            return
+
+        other_params["free_flow_ego_mean_speed"] = free_flow_mean_speed
+        other_params["ego_mean_speed_delta_over_free_flow"] = (
+            mean_speed - free_flow_mean_speed
+        ) / free_flow_mean_speed
+
+        trip_mean_speed = _metric(simout, "ego_trip_mean_speed")
+        free_flow_trip_mean_speed = _finite_float(self.free_flow_ego_trip_mean_speed)
+        if (
+            trip_mean_speed is None
+            or free_flow_trip_mean_speed is None
+            or free_flow_trip_mean_speed <= 0.0
+        ):
+            return
+
+        other_params["free_flow_ego_trip_mean_speed"] = free_flow_trip_mean_speed
+        other_params["ego_trip_mean_speed_delta_over_free_flow"] = (
+            trip_mean_speed - free_flow_trip_mean_speed
+        ) / free_flow_trip_mean_speed
 
 
 class CriticalECoDriveBattery(Critical):
@@ -91,7 +148,7 @@ def _metric(simout: SimulationOutput, name: str) -> Optional[float]:
     return _finite_float(simout.otherParams.get(name))
 
 
-def _net_energy_consumed(simout: SimulationOutput) -> float:
+def _net_energy_consumed(simout: SimulationOutput) -> Optional[float]:
     value = _metric(simout, "net_energy_consumed")
     if value is not None:
         return value
@@ -113,7 +170,7 @@ def _net_energy_consumed(simout: SimulationOutput) -> float:
     if initial_battery is not None and final_battery is not None:
         return initial_battery - final_battery
 
-    return 0.0
+    return None
 
 
 def _first_metric(simout: SimulationOutput, *keys: str) -> Optional[float]:

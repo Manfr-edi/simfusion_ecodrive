@@ -36,9 +36,9 @@ DEFAULT_EGO_MODEL_PARAMETERS = {
     "frontSurfaceArea": 2.2,
     "mass": 1919,
     "rotatingMass": 80,
-    "propulsionEfficiency": 0.98,
+    "propulsionEfficiency": 0.80,
     "radialDragCoefficient": 0.1,
-    "recuperationEfficiency": 0.96,
+    "recuperationEfficiency": 0.80,
     "rollDragCoefficient": 0.01,
     "stoppingThreshold": 0.1,
 }
@@ -274,7 +274,7 @@ class ECoDriveSimulator(Simulator):
         scenario_path: str,
         sim_time: float = 600.0,
         time_step: float = 0.05,
-        do_visualize: bool = True,
+        do_visualize: bool = False,
     ) -> List[SimulationOutput]:
         if _automated_simulate is None:
             raise ImportError(

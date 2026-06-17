@@ -449,6 +449,15 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--free_flow_baseline_runs",
+        type=int,
+        default=3,
+        help=(
+            "Number of traffic-free preliminary simulations to average when "
+            "estimating the free-flow net-energy and mean-speed baselines."
+        ),
+    )
+    parser.add_argument(
         "--list_autoware_path_edges",
         action="store_true",
         help=(
@@ -548,6 +557,40 @@ def finite_float(value):
     return number
 
 
+def finite_positive_float(value):
+    number = finite_float(value)
+    if number is None or number <= 0.0:
+        return None
+    return number
+
+
+def finite_float_mean(values):
+    finite_values = [
+        float(value)
+        for value in values
+        if finite_float(value) is not None
+    ]
+    if not finite_values:
+        return None
+    return float(np.mean(finite_values))
+
+
+def finite_float_std(values):
+    finite_values = [
+        float(value)
+        for value in values
+        if finite_float(value) is not None
+    ]
+    if len(finite_values) < 2:
+        return 0.0 if finite_values else None
+    return float(np.std(finite_values, ddof=1))
+
+
+def simout_metric(simout, name):
+    other_params = getattr(simout, "otherParams", {}) or {}
+    return finite_float(other_params.get(name))
+
+
 def run_free_flow_baseline(args, scenario_defaults, fitness_function):
     if args.free_flow_net_energy_consumed is not None:
         fitness_function.set_free_flow_net_energy_consumed(
@@ -564,34 +607,99 @@ def run_free_flow_baseline(args, scenario_defaults, fitness_function):
         args.xl,
         scenario_defaults,
     )
+    run_count = max(1, int(args.free_flow_baseline_runs))
     log.info(
-        "Running free-flow baseline with variables=%s values=%s",
+        "Running %s free-flow baseline simulations with variables=%s values=%s",
+        run_count,
         variable_names,
         values,
     )
-    simout = ECoDriveSimulator.simulate(
-        [values],
+    simouts = ECoDriveSimulator.simulate(
+        [list(values) for _ in range(run_count)],
         variable_names,
         args.scenario,
         sim_time=args.simulation_time,
         time_step=args.sampling_time,
         do_visualize=False,
-    )[0]
-    net_energy_consumed = fitness_function.net_energy_consumed(simout)
-    fitness_function.set_free_flow_net_energy_consumed(net_energy_consumed)
+    )
 
-    other_params = getattr(simout, "otherParams", {}) or {}
+    replicate_metadata = []
+    valid_net_energies = []
+    valid_mean_speeds = []
+    valid_trip_mean_speeds = []
+    for replicate_index, simout in enumerate(simouts, start=1):
+        other_params = getattr(simout, "otherParams", {}) or {}
+        net_energy_consumed = fitness_function.net_energy_consumed(simout)
+        mean_speed = simout_metric(simout, "ego_mean_speed")
+        trip_mean_speed = simout_metric(simout, "ego_trip_mean_speed")
+        valid_net_energy = finite_positive_float(net_energy_consumed)
+        valid_mean_speed = finite_positive_float(mean_speed)
+        valid_trip_mean_speed = finite_positive_float(trip_mean_speed)
+        if valid_net_energy is not None:
+            valid_net_energies.append(valid_net_energy)
+        if valid_mean_speed is not None:
+            valid_mean_speeds.append(valid_mean_speed)
+        if valid_trip_mean_speed is not None:
+            valid_trip_mean_speeds.append(valid_trip_mean_speed)
+        replicate_metadata.append(
+            {
+                "replicate": replicate_index,
+                "net_energy_consumed": finite_float(net_energy_consumed),
+                "ego_mean_speed": mean_speed,
+                "ego_mean_speed_kmh": simout_metric(simout, "ego_mean_speed_kmh"),
+                "ego_trip_mean_speed": trip_mean_speed,
+                "final_battery_capacity": simout_metric(simout, "final_battery_capacity"),
+                "initial_battery_capacity": simout_metric(simout, "initial_battery_capacity"),
+                "total_energy_consumed": simout_metric(simout, "total_energy_consumed"),
+                "total_energy_regenerated": simout_metric(simout, "total_energy_regenerated"),
+                "evaluation_id": other_params.get("evaluation_id"),
+                "simulation_status": other_params.get("simulation_status"),
+                "completion_reason": other_params.get("completion_reason"),
+                "simulation_failed": other_params.get("simulation_failed"),
+                "scenario_folder": other_params.get("scenario_folder"),
+                "used_for_net_energy_average": valid_net_energy is not None,
+                "used_for_mean_speed_average": valid_mean_speed is not None,
+                "used_for_trip_mean_speed_average": valid_trip_mean_speed is not None,
+            }
+        )
+
+    if not valid_net_energies:
+        raise RuntimeError(
+            "No valid positive free-flow net-energy baseline was produced. "
+            f"Replicates: {replicate_metadata}"
+        )
+
+    net_energy_consumed = float(np.mean(valid_net_energies))
+    fitness_function.set_free_flow_net_energy_consumed(net_energy_consumed)
+    mean_speed = finite_float_mean(valid_mean_speeds)
+    if mean_speed is not None and mean_speed > 0.0:
+        fitness_function.set_free_flow_ego_mean_speed(mean_speed)
+    trip_mean_speed = finite_float_mean(valid_trip_mean_speeds)
+    if trip_mean_speed is not None and trip_mean_speed > 0.0:
+        fitness_function.set_free_flow_ego_trip_mean_speed(trip_mean_speed)
+
     return {
-        "source": "simulated_free_flow",
+        "source": "simulated_free_flow_mean",
         "net_energy_consumed": net_energy_consumed,
+        "net_energy_consumed_std": finite_float_std(valid_net_energies),
+        "net_energy_consumed_sample_count": len(valid_net_energies),
+        "ego_mean_speed": mean_speed,
+        "ego_mean_speed_kmh": mean_speed * 3.6 if mean_speed is not None else None,
+        "ego_mean_speed_std": finite_float_std(valid_mean_speeds),
+        "ego_mean_speed_sample_count": len(valid_mean_speeds),
+        "ego_trip_mean_speed": trip_mean_speed,
+        "ego_trip_mean_speed_kmh": (
+            trip_mean_speed * 3.6 if trip_mean_speed is not None else None
+        ),
+        "ego_trip_mean_speed_std": finite_float_std(valid_trip_mean_speeds),
+        "ego_trip_mean_speed_sample_count": len(valid_trip_mean_speeds),
         "formula": "(net_energy_consumed - free_flow_net_energy_consumed) / free_flow_net_energy_consumed",
+        "mean_speed_formula": "(ego_mean_speed - free_flow_ego_mean_speed) / free_flow_ego_mean_speed",
+        "trip_mean_speed_formula": "(ego_trip_mean_speed - free_flow_ego_trip_mean_speed) / free_flow_ego_trip_mean_speed",
+        "requested_runs": run_count,
         "variables": variable_names,
         "values": values,
-        "evaluation_id": other_params.get("evaluation_id"),
-        "simulation_status": other_params.get("simulation_status"),
-        "completion_reason": other_params.get("completion_reason"),
-        "simulation_failed": other_params.get("simulation_failed"),
-        "scenario_folder": other_params.get("scenario_folder"),
+        "replicates": replicate_metadata,
     }
 
 

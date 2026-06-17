@@ -836,8 +836,15 @@ def _simulation_metadata_header(problem=None):
     if _include_ecodrive_energy_metadata(problem):
         header.extend([
             "Net_Energy_Consumed",
+            "Total_Energy_Consumed",
+            "Total_Energy_Regenerated",
             "Free_Flow_Net_Energy_Consumed",
             "Net_Energy_Delta_Over_Free_Flow",
+            "Free_Flow_Ego_Mean_Speed",
+            "Ego_Mean_Speed_Delta_Over_Free_Flow",
+            "Free_Flow_Ego_Trip_Mean_Speed",
+            "Ego_Trip_Mean_Speed_Delta_Over_Free_Flow",
+            "Initial_Battery_Capacity",
             "Final_Battery_Capacity",
         ])
     return header
@@ -858,8 +865,15 @@ def _simulation_metadata_row(ind, problem=None):
     if _include_ecodrive_energy_metadata(problem):
         row.extend([
             _formatted_metadata_float(metadata, "reported_net_energy_consumed"),
+            _formatted_metadata_float(metadata, "total_energy_consumed"),
+            _formatted_metadata_float(metadata, "total_energy_regenerated"),
             _formatted_metadata_float(metadata, "free_flow_net_energy_consumed"),
             _formatted_metadata_float(metadata, "net_energy_delta_over_free_flow"),
+            _formatted_metadata_float(metadata, "free_flow_ego_mean_speed"),
+            _formatted_metadata_float(metadata, "ego_mean_speed_delta_over_free_flow"),
+            _formatted_metadata_float(metadata, "free_flow_ego_trip_mean_speed"),
+            _formatted_metadata_float(metadata, "ego_trip_mean_speed_delta_over_free_flow"),
+            _formatted_metadata_float(metadata, "initial_battery_capacity"),
             _formatted_metadata_float(metadata, "final_battery_capacity"),
         ])
     return row
@@ -867,7 +881,12 @@ def _simulation_metadata_row(ind, problem=None):
 
 def _include_ecodrive_energy_metadata(problem):
     objective_names = getattr(problem, "objective_names", ())
-    return "Net energy consumed" in objective_names
+    fitness_function = getattr(problem, "fitness_function", None)
+    return (
+        "Net energy consumed" in objective_names
+        or "Final battery capacity" in objective_names
+        or fitness_function.__class__.__name__ == "FitnessECoDriveBattery"
+    )
 
 
 def _formatted_metadata_float(metadata, key):
