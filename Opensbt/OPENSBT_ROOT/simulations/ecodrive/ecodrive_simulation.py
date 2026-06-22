@@ -182,6 +182,7 @@ AUTOMATED_ECODRIVE_ROOT, _IMPORT_ERROR, _automated_simulate = None, None, None
 _EVALUATION_COUNTERS: Dict[str, int] = {}
 _AUTOWARE_PATH_EDGE_REPORT_CACHE: Dict[tuple, Dict[str, Any]] = {}
 _AUTOWARE_REFERENCE_PATH_CACHE: Dict[tuple, Dict[str, Any]] = {}
+_TRAFFIC_VEHICLE_CAPACITY_REPORT_CACHE: Dict[tuple, Dict[str, Any]] = {}
 
 
 def _candidate_carla_python_executables() -> Iterable[Path]:
@@ -579,6 +580,123 @@ def traffic_source_edge_candidates(config: Dict[str, Any]) -> List[str]:
 def traffic_destination_edge_candidates(config: Dict[str, Any]) -> List[str]:
     """Return the edge IDs selectable by traffic_destination_edge_index."""
     return _traffic_endpoint_edge_candidates("traffic_destination_edge_index", config)
+
+
+def traffic_vehicle_capacity_report(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Estimate how many equal-length traffic vehicles fit on the fixed ego route."""
+    from ecodrive.scenario import sumo_route_tools as route_tools
+
+    effective_config = copy.deepcopy(DEFAULT_ECODRIVE_CONFIG)
+    _deep_update(effective_config, config)
+    config = effective_config
+    town = config.get("town") or "Town04"
+    source_edge = config.get("ego_source_edge")
+    destination_edge = config.get("ego_destination_edge")
+    vehicle_type = config.get("traffic_vehicle_type") or route_tools.DEFAULT_VEHICLE_TYPE
+    if vehicle_type == "random":
+        vehicle_type = route_tools.DEFAULT_VEHICLE_TYPE
+    if not source_edge or not destination_edge:
+        raise ValueError(
+            "ego_source_edge and ego_destination_edge are required to calculate "
+            "traffic_vehicle_count capacity."
+        )
+
+    route_tools.set_active_carla_version("0.9.13")
+    cache_key = (town, str(source_edge), str(destination_edge), str(vehicle_type))
+    if cache_key in _TRAFFIC_VEHICLE_CAPACITY_REPORT_CACHE:
+        return copy.deepcopy(_TRAFFIC_VEHICLE_CAPACITY_REPORT_CACHE[cache_key])
+
+    edge_ids, route_length_m = _sumo_route_edge_ids(
+        route_tools,
+        town=str(town),
+        source_edge=str(source_edge),
+        destination_edge=str(destination_edge),
+    )
+    edge_by_id = {edge.edge_id: edge for edge in route_tools.read_sumo_edges(town)}
+    route_lane_capacity_m = 0.0
+    edge_details = []
+    for edge_id in edge_ids:
+        edge = edge_by_id.get(edge_id)
+        if edge is None:
+            continue
+        edge_lane_capacity_m = float(edge.length) * int(edge.lane_count)
+        route_lane_capacity_m += edge_lane_capacity_m
+        edge_details.append(
+            {
+                "edge_id": edge_id,
+                "length_m": float(edge.length),
+                "lane_count": int(edge.lane_count),
+                "lane_capacity_m": edge_lane_capacity_m,
+            }
+        )
+
+    vehicle_length_m = _sumo_vehicle_length_m(route_tools, str(vehicle_type))
+    raw_capacity = int(math.floor(route_lane_capacity_m / vehicle_length_m))
+    ego_slots_reserved = 1
+    traffic_capacity = max(0, raw_capacity - ego_slots_reserved)
+    capacity_report = {
+        "town": town,
+        "ego_source_edge": source_edge,
+        "ego_destination_edge": destination_edge,
+        "traffic_vehicle_type": vehicle_type,
+        "traffic_vehicle_length_m": vehicle_length_m,
+        "ego_slots_reserved": ego_slots_reserved,
+        "route_edge_ids": edge_ids,
+        "route_edge_count": len(edge_ids),
+        "route_length_m": route_length_m,
+        "route_lane_capacity_m": route_lane_capacity_m,
+        "raw_vehicle_slots": raw_capacity,
+        "traffic_vehicle_capacity": traffic_capacity,
+        "edge_details": edge_details,
+    }
+    _TRAFFIC_VEHICLE_CAPACITY_REPORT_CACHE[cache_key] = capacity_report
+    return copy.deepcopy(capacity_report)
+
+
+def _sumo_route_edge_ids(
+    route_tools: Any,
+    *,
+    town: str,
+    source_edge: str,
+    destination_edge: str,
+) -> Tuple[List[str], float]:
+    """Return the offline SUMO shortest route used for capacity estimates."""
+    try:
+        import sumolib  # type: ignore
+    except ImportError:
+        tools_dir = getattr(route_tools, "SUMO_TOOLS_DIR", None)
+        if tools_dir is not None and str(tools_dir) not in sys.path:
+            sys.path.append(str(tools_dir))
+        import sumolib  # type: ignore
+
+    net = sumolib.net.readNet(str(route_tools.map_net_file(town)))
+    from_edge = net.getEdge(source_edge)
+    to_edge = net.getEdge(destination_edge)
+    route, cost = net.getShortestPath(from_edge, to_edge)
+    if not route:
+        raise ValueError(
+            f"No SUMO route found from {source_edge!r} to {destination_edge!r} in {town}."
+        )
+
+    return [edge.getID() for edge in route], float(cost)
+
+
+def _sumo_vehicle_length_m(route_tools: Any, vehicle_type: str) -> float:
+    """Return the SUMO vType length for a traffic vehicle."""
+    fallback_length_m = 4.808821678161621
+    for path in (route_tools.CARLA_VTYPE_FILE, route_tools.EGO_VTYPE_FILE):
+        if path is None or not path.exists():
+            continue
+        root = ET.parse(path).getroot()
+        for vtype in root.findall("vType"):
+            if vtype.get("id") != vehicle_type:
+                continue
+            try:
+                length = float(vtype.get("length", "") or "")
+            except ValueError:
+                length = fallback_length_m
+            return length if length > 0 else fallback_length_m
+    return fallback_length_m
 
 
 def autoware_path_edge_report(config: Dict[str, Any]) -> Dict[str, Any]:

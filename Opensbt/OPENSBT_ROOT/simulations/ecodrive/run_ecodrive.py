@@ -61,6 +61,7 @@ from simulations.ecodrive.ecodrive_simulation import (
     traffic_congestion_edge_candidates,
     traffic_destination_edge_candidates,
     traffic_source_edge_candidates,
+    traffic_vehicle_capacity_report,
 )
 from simulations.utils import generate_problem_name
 
@@ -95,6 +96,11 @@ def discretize_vehicle_count(value):
     value = math.floor(value / VEHICLE_COUNT_STEP + 0.5) * VEHICLE_COUNT_STEP
     value = min(VEHICLE_COUNT_MAX, max(VEHICLE_COUNT_MIN, value))
     return int(value)
+
+
+def stepped_vehicle_count_capacity(value):
+    value = int(math.floor(float(value)))
+    return int(math.floor(value / VEHICLE_COUNT_STEP) * VEHICLE_COUNT_STEP)
 
 
 def discretize_integer(value, lower=None, upper=None):
@@ -738,6 +744,26 @@ if scenario_config_path.exists() and scenario_config_path.suffix.lower() == ".js
         scenario_payload.get("defaults", scenario_payload),
     )
 
+traffic_vehicle_capacity = traffic_vehicle_capacity_report(scenario_defaults)
+traffic_vehicle_count_capacity = int(traffic_vehicle_capacity["traffic_vehicle_capacity"])
+stepped_vehicle_count_max = stepped_vehicle_count_capacity(traffic_vehicle_count_capacity)
+if stepped_vehicle_count_max < VEHICLE_COUNT_MIN:
+    raise ValueError(
+        "The fixed ego route cannot host the minimum traffic_vehicle_count: "
+        f"capacity={traffic_vehicle_count_capacity}, stepped_capacity={stepped_vehicle_count_max}, "
+        f"minimum={VEHICLE_COUNT_MIN}. Route capacity report: {traffic_vehicle_capacity}"
+    )
+VEHICLE_COUNT_MAX = stepped_vehicle_count_max
+log.info(
+    "traffic_vehicle_count max set from fixed ego-route capacity: raw=%s, stepped=%s, "
+    "vehicle_length=%.3f m, route_lane_capacity=%.1f m, ego_slots_reserved=%s",
+    traffic_vehicle_count_capacity,
+    VEHICLE_COUNT_MAX,
+    traffic_vehicle_capacity["traffic_vehicle_length_m"],
+    traffic_vehicle_capacity["route_lane_capacity_m"],
+    traffic_vehicle_capacity["ego_slots_reserved"],
+)
+
 traffic_congestion_report = autoware_path_edge_report(scenario_defaults)
 traffic_congestion_candidates = traffic_congestion_edge_candidates(scenario_defaults)
 traffic_source_candidates = traffic_source_edge_candidates(scenario_defaults)
@@ -802,6 +828,21 @@ if args.xl is None or args.xu is None:
 
 if len(args.variables) != len(args.xl) or len(args.variables) != len(args.xu):
     raise ValueError("--variables, --xl and --xu must have the same length")
+
+if "traffic_vehicle_count" in args.variables:
+    vehicle_count_index = args.variables.index("traffic_vehicle_count")
+    if args.xu[vehicle_count_index] > VEHICLE_COUNT_MAX:
+        raise ValueError(
+            "traffic_vehicle_count upper bound exceeds the fixed ego-route capacity: "
+            f"requested xu={args.xu[vehicle_count_index]}, max={VEHICLE_COUNT_MAX}, "
+            f"raw_capacity={traffic_vehicle_count_capacity}."
+        )
+    if args.xl[vehicle_count_index] > VEHICLE_COUNT_MAX:
+        raise ValueError(
+            "traffic_vehicle_count lower bound exceeds the fixed ego-route capacity: "
+            f"requested xl={args.xl[vehicle_count_index]}, max={VEHICLE_COUNT_MAX}, "
+            f"raw_capacity={traffic_vehicle_count_capacity}."
+        )
 
 route_scoped_congestion = (
     "traffic_congestion_edge_index" in args.variables
@@ -897,6 +938,8 @@ wandb_config = {
     "traffic_vehicle_count_min": VEHICLE_COUNT_MIN,
     "traffic_vehicle_count_max": VEHICLE_COUNT_MAX,
     "traffic_vehicle_count_step": VEHICLE_COUNT_STEP,
+    "traffic_vehicle_count_raw_capacity": traffic_vehicle_count_capacity,
+    "traffic_vehicle_capacity_report": traffic_vehicle_capacity,
     "objective_names": objective_names,
     "objective_directions": objective_directions,
     "ordinal_variables": ordinal_variables,
