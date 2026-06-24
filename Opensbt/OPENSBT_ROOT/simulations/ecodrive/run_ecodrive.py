@@ -71,7 +71,8 @@ log = logging.getLogger(__name__)
 WANDB_TAG_MAX_LENGTH = 64
 VEHICLE_COUNT_MIN = 10
 VEHICLE_COUNT_MAX = 150
-VEHICLE_COUNT_STEP = 10
+VEHICLE_COUNT_LEVEL_COUNT = 10
+VEHICLE_COUNT_VALUES = []
 EDGE_INDEX_SUFFIX = "_edge_index"
 ORDINAL_EDGE_INDEX_VARIABLES = {"ego_source_near_congestion_index"}
 LOCAL_EDGE_CANDIDATE_COUNT = 10
@@ -91,16 +92,57 @@ def wandb_tag(name, value):
     return f"{name}:{str(value)[:keep]}{suffix}"
 
 
-def discretize_vehicle_count(value):
+def adaptive_vehicle_count_max(capacity, factor):
+    capacity = int(math.floor(float(capacity)))
+    factor = float(factor)
+    if not math.isfinite(factor) or factor <= 0.0 or factor > 1.0:
+        raise ValueError("traffic_vehicle_capacity_factor must be in the interval (0, 1].")
+    return int(math.floor(capacity * factor))
+
+
+def adaptive_vehicle_count_values(minimum, maximum, level_count):
+    minimum = int(math.ceil(float(minimum)))
+    maximum = int(math.floor(float(maximum)))
+    level_count = int(level_count)
+    if level_count < 2:
+        raise ValueError("traffic_vehicle_count level count must be at least 2.")
+    if maximum < minimum:
+        raise ValueError(
+            f"traffic_vehicle_count maximum {maximum} is lower than minimum {minimum}."
+        )
+
+    values = [
+        max(minimum, int(round(maximum * level / level_count)))
+        for level in range(1, level_count + 1)
+    ]
+    values = sorted(set(values))
+    if len(values) != level_count:
+        raise ValueError(
+            "The effective traffic_vehicle_count range is too narrow to produce "
+            f"{level_count} distinct levels: min={minimum}, max={maximum}, values={values}."
+        )
+    return values
+
+
+def discretize_vehicle_count(value, lower=None, upper=None):
+    if not VEHICLE_COUNT_VALUES:
+        raise RuntimeError("traffic_vehicle_count values have not been initialized.")
+
+    allowed_values = VEHICLE_COUNT_VALUES
+    if lower is not None:
+        lower = int(math.ceil(float(lower)))
+        allowed_values = [item for item in allowed_values if item >= lower]
+    if upper is not None:
+        upper = int(math.floor(float(upper)))
+        allowed_values = [item for item in allowed_values if item <= upper]
+    if not allowed_values:
+        raise ValueError(
+            "No adaptive traffic_vehicle_count values remain after applying bounds "
+            f"lower={lower}, upper={upper}. Full values: {VEHICLE_COUNT_VALUES}"
+        )
+
     value = float(value)
-    value = math.floor(value / VEHICLE_COUNT_STEP + 0.5) * VEHICLE_COUNT_STEP
-    value = min(VEHICLE_COUNT_MAX, max(VEHICLE_COUNT_MIN, value))
-    return int(value)
-
-
-def stepped_vehicle_count_capacity(value):
-    value = int(math.floor(float(value)))
-    return int(math.floor(value / VEHICLE_COUNT_STEP) * VEHICLE_COUNT_STEP)
+    return int(min(allowed_values, key=lambda item: (abs(item - value), item)))
 
 
 def discretize_integer(value, lower=None, upper=None):
@@ -174,7 +216,11 @@ def discretize_ecodrive_design(X, variable_names, xl=None, xu=None):
         for variable_index in variable_indexes:
             variable_name = variable_names[variable_index]
             if variable_name == "traffic_vehicle_count":
-                row[variable_index] = discretize_vehicle_count(row[variable_index])
+                row[variable_index] = discretize_vehicle_count(
+                    row[variable_index],
+                    lower=variable_bound(xl, variable_index),
+                    upper=variable_bound(xu, variable_index),
+                )
             elif (
                 variable_name.endswith(EDGE_INDEX_SUFFIX)
                 or variable_name in ORDINAL_EDGE_INDEX_VARIABLES
@@ -443,6 +489,16 @@ def parse_args():
     )
     parser.add_argument("--simulation_time", type=float, default=600.0)
     parser.add_argument("--sampling_time", type=float, default=0.1)
+    parser.add_argument(
+        "--traffic_vehicle_capacity_factor",
+        type=float,
+        default=None,
+        help=(
+            "Fraction of the fixed-route traffic capacity used as the effective "
+            "traffic_vehicle_count maximum. If omitted, the scenario JSON value "
+            "'traffic_vehicle_capacity_factor' is used, falling back to 0.8."
+        ),
+    )
     parser.add_argument(
         "--free_flow_net_energy_consumed",
         "--free_flow_energy_consumed",
@@ -746,19 +802,38 @@ if scenario_config_path.exists() and scenario_config_path.suffix.lower() == ".js
 
 traffic_vehicle_capacity = traffic_vehicle_capacity_report(scenario_defaults)
 traffic_vehicle_count_capacity = int(traffic_vehicle_capacity["traffic_vehicle_capacity"])
-stepped_vehicle_count_max = stepped_vehicle_count_capacity(traffic_vehicle_count_capacity)
-if stepped_vehicle_count_max < VEHICLE_COUNT_MIN:
+traffic_vehicle_capacity_factor = (
+    args.traffic_vehicle_capacity_factor
+    if args.traffic_vehicle_capacity_factor is not None
+    else scenario_defaults.get("traffic_vehicle_capacity_factor", 0.8)
+)
+args.traffic_vehicle_capacity_factor = traffic_vehicle_capacity_factor
+effective_vehicle_count_max = adaptive_vehicle_count_max(
+    traffic_vehicle_count_capacity,
+    traffic_vehicle_capacity_factor,
+)
+if effective_vehicle_count_max < VEHICLE_COUNT_MIN:
     raise ValueError(
         "The fixed ego route cannot host the minimum traffic_vehicle_count: "
-        f"capacity={traffic_vehicle_count_capacity}, stepped_capacity={stepped_vehicle_count_max}, "
+        f"capacity={traffic_vehicle_count_capacity}, "
+        f"capacity_factor={traffic_vehicle_capacity_factor}, "
+        f"effective_capacity={effective_vehicle_count_max}, "
         f"minimum={VEHICLE_COUNT_MIN}. Route capacity report: {traffic_vehicle_capacity}"
     )
-VEHICLE_COUNT_MAX = stepped_vehicle_count_max
-log.info(
-    "traffic_vehicle_count max set from fixed ego-route capacity: raw=%s, stepped=%s, "
-    "vehicle_length=%.3f m, route_lane_capacity=%.1f m, ego_slots_reserved=%s",
-    traffic_vehicle_count_capacity,
+VEHICLE_COUNT_MAX = effective_vehicle_count_max
+VEHICLE_COUNT_VALUES = adaptive_vehicle_count_values(
+    VEHICLE_COUNT_MIN,
     VEHICLE_COUNT_MAX,
+    VEHICLE_COUNT_LEVEL_COUNT,
+)
+log.info(
+    "traffic_vehicle_count max set from fixed ego-route capacity: raw=%s, "
+    "factor=%.3f, effective=%s, levels=%s, vehicle_length=%.3f m, "
+    "route_lane_capacity=%.1f m, ego_slots_reserved=%s",
+    traffic_vehicle_count_capacity,
+    traffic_vehicle_capacity_factor,
+    VEHICLE_COUNT_MAX,
+    VEHICLE_COUNT_VALUES,
     traffic_vehicle_capacity["traffic_vehicle_length_m"],
     traffic_vehicle_capacity["route_lane_capacity_m"],
     traffic_vehicle_capacity["ego_slots_reserved"],
@@ -937,7 +1012,9 @@ wandb_config = {
     "scenario_name": scenario_path.name,
     "traffic_vehicle_count_min": VEHICLE_COUNT_MIN,
     "traffic_vehicle_count_max": VEHICLE_COUNT_MAX,
-    "traffic_vehicle_count_step": VEHICLE_COUNT_STEP,
+    "traffic_vehicle_count_level_count": VEHICLE_COUNT_LEVEL_COUNT,
+    "traffic_vehicle_count_values": VEHICLE_COUNT_VALUES,
+    "traffic_vehicle_capacity_factor": traffic_vehicle_capacity_factor,
     "traffic_vehicle_count_raw_capacity": traffic_vehicle_count_capacity,
     "traffic_vehicle_capacity_report": traffic_vehicle_capacity,
     "objective_names": objective_names,
