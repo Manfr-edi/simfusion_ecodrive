@@ -47,6 +47,9 @@ DEFAULT_EGO_MODEL_PARAMETERS = {
 DEFAULT_ECODRIVE_CONFIG = {
     "town": "Town04",
     "headless": True,
+    "traffic_light_handling_mode": None,
+    "force_carla_traffic_lights_green": True,
+    "disable_autoware_traffic_light_handling": True,
     "traffic_generation_mode": "random",
     "traffic_congestion_edge": "-41.0.00",
     "traffic_congestion_edge_scope": "all",
@@ -55,9 +58,15 @@ DEFAULT_ECODRIVE_CONFIG = {
     "traffic_destination_edge": None,
     "traffic_vehicle_count": 5,
     "traffic_seed": 42,
+    "traffic_vehicle_type_seed": None,
     "traffic_spawn_time": 0.0,
     "traffic_stop_spawn_time": 20.0,
     "traffic_vehicle_type": "random",
+    "traffic_random_vehicle_type": False,
+    "traffic_random_vehicle_cars_only": False,
+    "traffic_vehicle_capacity_factor": 0.8,
+    "edge_order_by": "spatial",
+    "edge_min_length": 0.0,
     "ego_starting_delay": 0.0,
     "ego_source_edge": "-38.0.00",
     "ego_destination_edge": "-41.0.00",
@@ -127,6 +136,7 @@ RELATIVE_EDGE_INDEX_FIELDS = {
 INT_FIELDS = {
     "traffic_vehicle_count",
     "traffic_seed",
+    "traffic_vehicle_type_seed",
     "runtime_retries",
 }
 
@@ -134,6 +144,8 @@ INT_FIELDS = {
 FLOAT_FIELDS = {
     "traffic_spawn_time",
     "traffic_stop_spawn_time",
+    "traffic_vehicle_capacity_factor",
+    "edge_min_length",
     "ego_starting_delay",
     "ego_max_battery_capacity",
     "ego_current_battery_charge",
@@ -160,7 +172,10 @@ FLOAT_FIELDS = {
 
 BOOL_FIELDS = {
     "headless",
+    "force_carla_traffic_lights_green",
+    "disable_autoware_traffic_light_handling",
     "traffic_random_vehicle_type",
+    "traffic_random_vehicle_cars_only",
     "stop_on_ego_arrival",
     "generate_plots",
     "cleanup_existing",
@@ -411,6 +426,20 @@ def _load_scenario_config(scenario_path: Optional[str]) -> Dict[str, Any]:
     return payload
 
 
+def effective_ecodrive_config(
+    scenario_config: Optional[Dict[str, Any]] = None,
+    *,
+    coerce: bool = True,
+) -> Dict[str, Any]:
+    """Return scenario config with ECoDrive defaults filled in."""
+    config = copy.deepcopy(DEFAULT_ECODRIVE_CONFIG)
+    if scenario_config:
+        _deep_update(config, scenario_config)
+    if coerce:
+        _coerce_config_types(config)
+    return config
+
+
 def _individual_to_dict(variable_names: List[str], individual: Individual) -> Dict[str, Any]:
     return {
         name: _to_builtin(value)
@@ -426,8 +455,7 @@ def _build_simulation_kwargs(
     do_visualize: bool,
     progress_log_file: Path,
 ) -> Dict[str, Any]:
-    config = copy.deepcopy(DEFAULT_ECODRIVE_CONFIG)
-    _deep_update(config, scenario_config)
+    config = effective_ecodrive_config(scenario_config, coerce=False)
 
     if "headless" not in scenario_config:
         config["headless"] = not bool(do_visualize)
@@ -583,18 +611,20 @@ def traffic_destination_edge_candidates(config: Dict[str, Any]) -> List[str]:
 
 
 def traffic_vehicle_capacity_report(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Estimate how many equal-length traffic vehicles fit on the fixed ego route."""
+    """Estimate how many traffic vehicles fit on the fixed ego route."""
     from ecodrive.scenario import sumo_route_tools as route_tools
 
-    effective_config = copy.deepcopy(DEFAULT_ECODRIVE_CONFIG)
-    _deep_update(effective_config, config)
-    config = effective_config
+    config = effective_ecodrive_config(config)
     town = config.get("town") or "Town04"
     source_edge = config.get("ego_source_edge")
     destination_edge = config.get("ego_destination_edge")
-    vehicle_type = config.get("traffic_vehicle_type") or route_tools.DEFAULT_VEHICLE_TYPE
-    if vehicle_type == "random":
-        vehicle_type = route_tools.DEFAULT_VEHICLE_TYPE
+    configured_vehicle_type = config.get("traffic_vehicle_type") or route_tools.DEFAULT_VEHICLE_TYPE
+    random_vehicle_type = _is_random_vehicle_type(
+        configured_vehicle_type,
+        config.get("traffic_random_vehicle_type", False),
+    )
+    cars_only = bool(config.get("traffic_random_vehicle_cars_only")) and random_vehicle_type
+    vehicle_type_seed = _traffic_vehicle_type_seed(config)
     if not source_edge or not destination_edge:
         raise ValueError(
             "ego_source_edge and ego_destination_edge are required to calculate "
@@ -602,7 +632,15 @@ def traffic_vehicle_capacity_report(config: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     route_tools.set_active_carla_version("0.9.13")
-    cache_key = (town, str(source_edge), str(destination_edge), str(vehicle_type))
+    cache_key = (
+        town,
+        str(source_edge),
+        str(destination_edge),
+        str(configured_vehicle_type),
+        bool(random_vehicle_type),
+        bool(cars_only),
+        int(vehicle_type_seed),
+    )
     if cache_key in _TRAFFIC_VEHICLE_CAPACITY_REPORT_CACHE:
         return copy.deepcopy(_TRAFFIC_VEHICLE_CAPACITY_REPORT_CACHE[cache_key])
 
@@ -630,15 +668,66 @@ def traffic_vehicle_capacity_report(config: Dict[str, Any]) -> Dict[str, Any]:
             }
         )
 
-    vehicle_length_m = _sumo_vehicle_length_m(route_tools, str(vehicle_type))
-    raw_capacity = int(math.floor(route_lane_capacity_m / vehicle_length_m))
     ego_slots_reserved = 1
-    traffic_capacity = max(0, raw_capacity - ego_slots_reserved)
+    capacity_details: Dict[str, Any] = {}
+    if random_vehicle_type:
+        vehicle_types = _random_vehicle_type_pool(
+            route_tools,
+            cars_only=cars_only,
+        )
+        vehicle_lengths_m = [
+            _sumo_vehicle_length_m(route_tools, str(vehicle_type))
+            for vehicle_type in vehicle_types
+        ]
+        longest_vehicle_type, vehicle_length_m = _longest_vehicle_type(
+            vehicle_types,
+            vehicle_lengths_m,
+        )
+        ego_slot_length_m = _sumo_vehicle_length_m(
+            route_tools,
+            str(route_tools.DEFAULT_VEHICLE_TYPE),
+        )
+        available_capacity_m = max(
+            0.0,
+            route_lane_capacity_m - ego_slots_reserved * ego_slot_length_m,
+        )
+        traffic_capacity = int(math.floor(available_capacity_m / vehicle_length_m))
+        raw_capacity = traffic_capacity + ego_slots_reserved
+        capacity_details = {
+            "traffic_vehicle_capacity_strategy": "conservative_longest_vehicle",
+            "traffic_random_vehicle_type": True,
+            "traffic_random_vehicle_cars_only": cars_only,
+            "traffic_random_vehicle_type_count": len(vehicle_types),
+            "traffic_random_vehicle_types": vehicle_types,
+            "traffic_vehicle_type_seed": vehicle_type_seed,
+            "traffic_longest_vehicle_type": longest_vehicle_type,
+            "traffic_vehicle_length_summary_m": _vehicle_length_summary(vehicle_lengths_m),
+            "ego_reserved_capacity_m": ego_slots_reserved * ego_slot_length_m,
+            "traffic_capacity_available_m": available_capacity_m,
+            "traffic_capacity_conservative_assumption": (
+                "Every random traffic vehicle is assumed to be as long as the "
+                "longest vehicle in the resolved random pool."
+            ),
+        }
+    else:
+        vehicle_type = str(configured_vehicle_type)
+        vehicle_length_m = _sumo_vehicle_length_m(route_tools, vehicle_type)
+        raw_capacity = int(math.floor(route_lane_capacity_m / vehicle_length_m))
+        traffic_capacity = max(0, raw_capacity - ego_slots_reserved)
+        capacity_details = {
+            "traffic_vehicle_capacity_strategy": "fixed_vehicle_length",
+            "traffic_random_vehicle_type": False,
+            "traffic_random_vehicle_cars_only": False,
+            "traffic_vehicle_type_seed": vehicle_type_seed,
+        }
+
     capacity_report = {
         "town": town,
         "ego_source_edge": source_edge,
         "ego_destination_edge": destination_edge,
-        "traffic_vehicle_type": vehicle_type,
+        "traffic_vehicle_type": (
+            "random" if random_vehicle_type else str(configured_vehicle_type)
+        ),
         "traffic_vehicle_length_m": vehicle_length_m,
         "ego_slots_reserved": ego_slots_reserved,
         "route_edge_ids": edge_ids,
@@ -648,9 +737,71 @@ def traffic_vehicle_capacity_report(config: Dict[str, Any]) -> Dict[str, Any]:
         "raw_vehicle_slots": raw_capacity,
         "traffic_vehicle_capacity": traffic_capacity,
         "edge_details": edge_details,
+        **capacity_details,
     }
     _TRAFFIC_VEHICLE_CAPACITY_REPORT_CACHE[cache_key] = capacity_report
     return copy.deepcopy(capacity_report)
+
+
+def _is_random_vehicle_type(vehicle_type: Any, random_vehicle_type: Any) -> bool:
+    return bool(_as_bool(random_vehicle_type)) or str(vehicle_type or "").strip().lower() == "random"
+
+
+def _traffic_vehicle_type_seed(config: Dict[str, Any]) -> int:
+    seed = config.get("traffic_vehicle_type_seed")
+    if seed is None:
+        seed = config.get("traffic_seed", 42)
+    return int(seed)
+
+
+def _random_vehicle_type_pool(route_tools: Any, *, cars_only: bool) -> List[str]:
+    vehicle_types = list(route_tools.available_vehicle_types())
+    if not vehicle_types:
+        raise ValueError(
+            "No traffic vehicle types are available in the active CARLA/SUMO "
+            "vType configuration."
+        )
+    if not cars_only:
+        return vehicle_types
+
+    specs = route_tools.carla_vehicle_type_specs()
+    filtered = [
+        vehicle_type
+        for vehicle_type in vehicle_types
+        if str(specs.get(vehicle_type, {}).get("vClass", "")).strip().lower()
+        == "passenger"
+    ]
+    if not filtered:
+        raise ValueError(
+            "traffic_random_vehicle_cars_only=True did not match any passenger "
+            "vehicle type in the active CARLA/SUMO vType configuration."
+        )
+    return filtered
+
+
+def _vehicle_length_summary(lengths_m: Sequence[float]) -> Dict[str, float]:
+    values = np.asarray(lengths_m, dtype=float)
+    return {
+        "min": float(np.min(values)),
+        "p50": float(np.percentile(values, 50)),
+        "mean": float(np.mean(values)),
+        "p95": float(np.percentile(values, 95)),
+        "max": float(np.max(values)),
+    }
+
+
+def _longest_vehicle_type(
+    vehicle_types: Sequence[str],
+    lengths_m: Sequence[float],
+) -> Tuple[str, float]:
+    pairs = [
+        (str(vehicle_type), float(length))
+        for vehicle_type, length in zip(vehicle_types, lengths_m)
+        if math.isfinite(float(length)) and float(length) > 0.0
+    ]
+    if not pairs:
+        raise ValueError("No positive vehicle length is available for capacity estimation.")
+    return max(pairs, key=lambda item: item[1])
 
 
 def _sumo_route_edge_ids(

@@ -58,6 +58,7 @@ from simulations.ecodrive.ecodrive_simulation import (
     PARAMETER_ALIASES,
     ECoDriveSimulator,
     autoware_path_edge_report,
+    effective_ecodrive_config,
     traffic_congestion_edge_candidates,
     traffic_destination_edge_candidates,
     traffic_source_edge_candidates,
@@ -790,22 +791,28 @@ if args.write_gifs:
 else:
     opensbt_config.NUM_GIF_MAX = 0
 
-scenario_defaults = {}
+scenario_config = {}
 scenario_config_path = Path(args.scenario)
 if scenario_config_path.exists() and scenario_config_path.suffix.lower() == ".json":
     with scenario_config_path.open(encoding="utf-8") as handle:
         scenario_payload = json.load(handle)
-    scenario_defaults = scenario_payload.get(
+    scenario_config = scenario_payload.get(
         "simulate_kwargs",
         scenario_payload.get("defaults", scenario_payload),
     )
+    if not isinstance(scenario_config, dict):
+        raise ValueError(f"ECoDrive scenario config must be a JSON object: {scenario_config_path}")
+
+scenario_defaults = effective_ecodrive_config(scenario_config)
+if args.traffic_vehicle_capacity_factor is not None:
+    scenario_defaults["traffic_vehicle_capacity_factor"] = args.traffic_vehicle_capacity_factor
 
 traffic_vehicle_capacity = traffic_vehicle_capacity_report(scenario_defaults)
 traffic_vehicle_count_capacity = int(traffic_vehicle_capacity["traffic_vehicle_capacity"])
 traffic_vehicle_capacity_factor = (
     args.traffic_vehicle_capacity_factor
     if args.traffic_vehicle_capacity_factor is not None
-    else scenario_defaults.get("traffic_vehicle_capacity_factor", 0.8)
+    else scenario_defaults["traffic_vehicle_capacity_factor"]
 )
 args.traffic_vehicle_capacity_factor = traffic_vehicle_capacity_factor
 effective_vehicle_count_max = adaptive_vehicle_count_max(
@@ -828,12 +835,14 @@ VEHICLE_COUNT_VALUES = adaptive_vehicle_count_values(
 )
 log.info(
     "traffic_vehicle_count max set from fixed ego-route capacity: raw=%s, "
-    "factor=%.3f, effective=%s, levels=%s, vehicle_length=%.3f m, "
-    "route_lane_capacity=%.1f m, ego_slots_reserved=%s",
+    "factor=%.3f, effective=%s, levels=%s, strategy=%s, car_only=%s, "
+    "vehicle_length=%.3f m, route_lane_capacity=%.1f m, ego_slots_reserved=%s",
     traffic_vehicle_count_capacity,
     traffic_vehicle_capacity_factor,
     VEHICLE_COUNT_MAX,
     VEHICLE_COUNT_VALUES,
+    traffic_vehicle_capacity["traffic_vehicle_capacity_strategy"],
+    traffic_vehicle_capacity["traffic_random_vehicle_cars_only"],
     traffic_vehicle_capacity["traffic_vehicle_length_m"],
     traffic_vehicle_capacity["route_lane_capacity_m"],
     traffic_vehicle_capacity["ego_slots_reserved"],
@@ -1010,6 +1019,8 @@ wandb_config = {
     **vars(args),
     "problem_name": problem_name,
     "scenario_name": scenario_path.name,
+    "scenario_config": scenario_config,
+    "scenario_effective_config": scenario_defaults,
     "traffic_vehicle_count_min": VEHICLE_COUNT_MIN,
     "traffic_vehicle_count_max": VEHICLE_COUNT_MAX,
     "traffic_vehicle_count_level_count": VEHICLE_COUNT_LEVEL_COUNT,

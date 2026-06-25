@@ -1,22 +1,28 @@
 {
   "seed_usage": {
-    "traffic_seed": "Used by ECoDrive for reproducible traffic generation: random-congestion trip candidates, duarouter routing seed, randomTrips mode, and random vehicle-type assignment when enabled."
+    "traffic_seed": "Used by ECoDrive for reproducible traffic generation: random-congestion trip candidates, duarouter routing seed, and randomTrips mode.",
+    "traffic_vehicle_type_seed": "Used by ECoDrive for reproducible random vehicle-type assignment when traffic_vehicle_type is random. If omitted, traffic_seed is used."
   },
   "simulate_kwargs": {
     "town": "Town04",
     "edge_order_by": "spatial",
     "edge_min_length": 0.0,
     "headless": true,
+    "traffic_light_handling_mode": "yellow_as_yield",
+    "force_carla_traffic_lights_green": false,
+    "disable_autoware_traffic_light_handling": false,
     "traffic_generation_mode": "congestion",
     "traffic_congestion_edge_scope": "ego_route",
     "traffic_endpoint_edge_scope": "ego_route_adjacent",
     "traffic_seed": 42,
+    "traffic_vehicle_type_seed": 42,
     "traffic_spawn_time": 5.0,
     "traffic_stop_spawn_time": 20.0,
-    "traffic_vehicle_type": "vehicle.tesla.model3",
+    "traffic_vehicle_type": "random",
+    "traffic_random_vehicle_cars_only": true,
     "ego_starting_delay": 15.0,
-    "ego_source_edge": "-46.0.00",
-    "ego_destination_edge": "-13.0.00",
+    "ego_source_edge": "9.0.00",
+    "ego_destination_edge": "5.0.00",
     "autoware_speed_limit_kmh": 50.0,
     "ego_energy_model": "Energy",
     "ego_max_battery_capacity": 75000,
